@@ -1,0 +1,670 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use ureq::{Agent, Error as UreqError};
+
+type HmacSha256 = Hmac<Sha256>;
+
+const DEFAULT_API_BASE_URL: &str = "https://auth.authforge.cc";
+static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone)]
+pub enum HeartbeatMode {
+    Local,
+    Server
+}
+
+pub struct AuthForgeConfig {
+    pub app_id: String,
+    pub app_secret: String,
+    pub heartbeat_mode: HeartbeatMode,
+    pub heartbeat_interval: u64,
+    pub api_base_url: String,
+    pub on_failure: Option<Box<dyn Fn(&str) + Send + Sync>>,
+    pub request_timeout: u64
+}
+
+impl Default for AuthForgeConfig {
+    fn default() -> Self {
+        Self {
+            app_id: String::new(),
+            app_secret: String::new(),
+            heartbeat_mode: HeartbeatMode::Local,
+            heartbeat_interval: 900,
+            api_base_url: DEFAULT_API_BASE_URL.to_string(),
+            on_failure: None,
+            request_timeout: 15
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LoginResult {
+    pub session_token: String,
+    pub expires_in: u64,
+    pub app_variables: Option<HashMap<String, Value>>,
+    pub license_variables: Option<HashMap<String, Value>>,
+    pub request_id: String
+}
+
+#[derive(Debug, Clone)]
+pub enum AuthForgeError {
+    InvalidApp,
+    InvalidKey,
+    Expired,
+    Revoked,
+    HwidMismatch,
+    NoCredits,
+    Blocked,
+    RateLimited,
+    ReplayDetected,
+    AppDisabled,
+    SessionExpired,
+    BadRequest,
+    ChecksumRequired,
+    ChecksumMismatch,
+    SignatureMismatch,
+    NetworkError(String),
+    Other(String)
+}
+
+#[derive(Clone)]
+struct RuntimeConfig {
+    app_id: String,
+    app_secret: String,
+    heartbeat_mode: HeartbeatMode,
+    heartbeat_interval: u64,
+    api_base_url: String,
+    request_timeout: u64,
+    on_failure: Option<Arc<dyn Fn(&str) + Send + Sync>>
+}
+
+#[derive(Debug, Clone)]
+struct SessionState {
+    authenticated: bool,
+    license_key: Option<String>,
+    session_token: Option<String>,
+    expires_in: Option<u64>,
+    session_data: Option<Value>,
+    app_variables: Option<HashMap<String, Value>>,
+    license_variables: Option<HashMap<String, Value>>
+}
+
+impl SessionState {
+    fn clear(&mut self) {
+        self.authenticated = false;
+        self.license_key = None;
+        self.session_token = None;
+        self.expires_in = None;
+        self.session_data = None;
+        self.app_variables = None;
+        self.license_variables = None;
+    }
+}
+
+struct ClientInner {
+    cfg: RuntimeConfig,
+    hwid: String,
+    state: Arc<Mutex<SessionState>>,
+    stop_signal: Arc<AtomicBool>,
+    heartbeat_handle: Mutex<Option<JoinHandle<()>>>
+}
+
+pub struct AuthForgeClient {
+    inner: Arc<ClientInner>
+}
+
+#[derive(Deserialize)]
+struct SignedResponse {
+    status: Value,
+    payload: Option<String>,
+    signature: Option<String>,
+    error: Option<String>
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SignedPayload {
+    session_token: String,
+    expires_in: u64,
+    nonce: String,
+    request_id: Option<String>,
+    app_variables: Option<HashMap<String, Value>>,
+    license_variables: Option<HashMap<String, Value>>,
+    #[serde(flatten)]
+    other: HashMap<String, Value>
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ValidateRequest<'a> {
+    app_id: &'a str,
+    app_secret: &'a str,
+    license_key: &'a str,
+    hwid: &'a str,
+    nonce: &'a str
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HeartbeatRequest<'a> {
+    app_id: &'a str,
+    session_token: &'a str,
+    nonce: &'a str,
+    hwid: &'a str
+}
+
+impl AuthForgeClient {
+    pub fn new(config: AuthForgeConfig) -> Self {
+        let on_failure = config.on_failure.map(Arc::<dyn Fn(&str) + Send + Sync>::from);
+        let runtime_cfg = RuntimeConfig {
+            app_id: config.app_id,
+            app_secret: config.app_secret,
+            heartbeat_mode: config.heartbeat_mode,
+            heartbeat_interval: if config.heartbeat_interval == 0 {
+                900
+            } else {
+                config.heartbeat_interval
+            },
+            api_base_url: if config.api_base_url.trim().is_empty() {
+                DEFAULT_API_BASE_URL.to_string()
+            } else {
+                config.api_base_url.trim_end_matches('/').to_string()
+            },
+            request_timeout: if config.request_timeout == 0 {
+                15
+            } else {
+                config.request_timeout
+            },
+            on_failure
+        };
+
+        let inner = ClientInner {
+            cfg: runtime_cfg,
+            hwid: generate_hwid(),
+            state: Arc::new(Mutex::new(SessionState {
+                authenticated: false,
+                license_key: None,
+                session_token: None,
+                expires_in: None,
+                session_data: None,
+                app_variables: None,
+                license_variables: None
+            })),
+            stop_signal: Arc::new(AtomicBool::new(false)),
+            heartbeat_handle: Mutex::new(None)
+        };
+
+        Self {
+            inner: Arc::new(inner)
+        }
+    }
+
+    pub fn login(&self, license_key: &str) -> Result<LoginResult, AuthForgeError> {
+        if self.inner.cfg.app_id.trim().is_empty() || self.inner.cfg.app_secret.trim().is_empty() {
+            return Err(AuthForgeError::InvalidApp);
+        }
+        if license_key.trim().is_empty() {
+            return Err(AuthForgeError::InvalidKey);
+        }
+
+        let nonce = generate_nonce();
+        let result = self.validate_once(license_key, &nonce)?;
+        self.start_heartbeat_thread();
+        Ok(result)
+    }
+
+    pub fn logout(&self) {
+        self.stop_heartbeat_thread();
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("authforge state mutex poisoned in logout");
+        state.clear();
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .map(|state| state.authenticated)
+            .unwrap_or(false)
+    }
+
+    pub fn get_session_data(&self) -> Option<Value> {
+        self.inner
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.session_data.clone())
+    }
+
+    pub fn get_app_variables(&self) -> Option<HashMap<String, Value>> {
+        self.inner
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.app_variables.clone())
+    }
+
+    pub fn get_license_variables(&self) -> Option<HashMap<String, Value>> {
+        self.inner
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.license_variables.clone())
+    }
+
+    fn validate_once(&self, license_key: &str, nonce: &str) -> Result<LoginResult, AuthForgeError> {
+        let request = ValidateRequest {
+            app_id: &self.inner.cfg.app_id,
+            app_secret: &self.inner.cfg.app_secret,
+            license_key,
+            hwid: &self.inner.hwid,
+            nonce
+        };
+
+        let (response, used_nonce) = self.post_json("/auth/validate", &request)?;
+        let payload = self.verify_signed_response(response, used_nonce.as_deref().unwrap_or(nonce))?;
+        let request_id = payload.request_id.clone().unwrap_or_default();
+
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| AuthForgeError::Other("state_lock_failed".to_string()))?;
+        state.authenticated = true;
+        state.license_key = Some(license_key.to_string());
+        state.session_token = Some(payload.session_token.clone());
+        state.expires_in = Some(payload.expires_in);
+        state.app_variables = payload.app_variables.clone();
+        state.license_variables = payload.license_variables.clone();
+        state.session_data = Some(serde_json::to_value(&payload).unwrap_or(Value::Null));
+
+        Ok(LoginResult {
+            session_token: payload.session_token,
+            expires_in: payload.expires_in,
+            app_variables: payload.app_variables,
+            license_variables: payload.license_variables,
+            request_id
+        })
+    }
+
+    fn server_heartbeat_with_retry(&self) -> Result<(), AuthForgeError> {
+        let session_token = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| AuthForgeError::Other("state_lock_failed".to_string()))?;
+            state
+                .session_token
+                .clone()
+                .ok_or_else(|| AuthForgeError::Other("missing_session_token".to_string()))?
+        };
+
+        let nonce = generate_nonce();
+        let request = HeartbeatRequest {
+            app_id: &self.inner.cfg.app_id,
+            session_token: &session_token,
+            nonce: &nonce,
+            hwid: &self.inner.hwid
+        };
+
+        let (response, used_nonce) = self.post_json("/auth/heartbeat", &request)?;
+        let payload = self.verify_signed_response(
+            response,
+            used_nonce.as_deref().unwrap_or(&nonce)
+        )?;
+        let session_data = serde_json::to_value(&payload).unwrap_or(Value::Null);
+        let session_token = payload.session_token;
+        let expires_in = payload.expires_in;
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| AuthForgeError::Other("state_lock_failed".to_string()))?;
+        state.authenticated = true;
+        state.session_token = Some(session_token);
+        state.expires_in = Some(expires_in);
+        state.session_data = Some(session_data);
+        Ok(())
+    }
+
+    fn local_heartbeat_check(&self) -> Result<(), AuthForgeError> {
+        let (authenticated, expires_in) = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| AuthForgeError::Other("state_lock_failed".to_string()))?;
+            (state.authenticated, state.expires_in)
+        };
+
+        if !authenticated {
+            return Err(AuthForgeError::Expired);
+        }
+
+        let expires = expires_in.ok_or(AuthForgeError::Expired)?;
+        let now = epoch_now();
+        if now >= expires {
+            return Err(AuthForgeError::Expired);
+        }
+
+        Ok(())
+    }
+
+    fn post_json<T: Serialize>(
+        &self,
+        path: &str,
+        body: &T
+    ) -> Result<(SignedResponse, Option<String>), AuthForgeError> {
+        let agent = build_agent(self.inner.cfg.request_timeout);
+        let url = format!("{}{}", self.inner.cfg.api_base_url, path);
+        let base_value = serde_json::to_value(body)
+            .map_err(|err| AuthForgeError::Other(format!("serialize_request_failed: {err}")))?;
+
+        let mut rate_attempt = 0;
+        let mut network_retried = false;
+        loop {
+            let mut request_value = base_value.clone();
+            let used_nonce = if rate_attempt > 0 {
+                refresh_nonce(&mut request_value)
+            } else {
+                extract_nonce(&request_value)
+            };
+
+            let response = agent.post(&url).send_json(request_value);
+            match response {
+                Ok(resp) => {
+                    let parsed = parse_signed_response(resp.into_string().unwrap_or_default())?;
+                    if response_error_code(&parsed).as_deref() == Some("rate_limited") && rate_attempt < 2 {
+                        thread::sleep(Duration::from_secs(if rate_attempt == 0 { 2 } else { 5 }));
+                        rate_attempt += 1;
+                        continue;
+                    }
+                    return Ok((parsed, used_nonce));
+                }
+                Err(UreqError::Status(_, response)) => {
+                    let body_text = response.into_string().unwrap_or_default();
+                    let parsed = parse_signed_response(body_text)?;
+                    if response_error_code(&parsed).as_deref() == Some("rate_limited") && rate_attempt < 2 {
+                        thread::sleep(Duration::from_secs(if rate_attempt == 0 { 2 } else { 5 }));
+                        rate_attempt += 1;
+                        continue;
+                    }
+                    return Ok((parsed, used_nonce));
+                }
+                Err(UreqError::Transport(err)) => {
+                    if !network_retried {
+                        network_retried = true;
+                        thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                    if let Some(callback) = &self.inner.cfg.on_failure {
+                        callback("network_error");
+                    }
+                    return Err(AuthForgeError::NetworkError(err.to_string()));
+                }
+            }
+        }
+    }
+
+    fn verify_signed_response(
+        &self,
+        response: SignedResponse,
+        expected_nonce: &str
+    ) -> Result<SignedPayload, AuthForgeError> {
+        if !is_success_status(&response.status) {
+            let server_error = response.error.unwrap_or_else(|| "unknown_error".to_string());
+            return Err(map_server_error(&server_error));
+        }
+
+        let payload_b64 = response
+            .payload
+            .ok_or_else(|| AuthForgeError::Other("missing_payload".to_string()))?;
+        let signature = response
+            .signature
+            .ok_or_else(|| AuthForgeError::Other("missing_signature".to_string()))?;
+
+        let derived_key = derive_signing_key(&self.inner.cfg.app_secret, expected_nonce);
+        let expected_signature = sign_payload(&payload_b64, &derived_key)?;
+        if signature.trim().to_ascii_lowercase() != expected_signature {
+            return Err(AuthForgeError::SignatureMismatch);
+        }
+
+        let payload_bytes = decode_base64_any(&payload_b64)?;
+        let payload: SignedPayload = serde_json::from_slice(&payload_bytes)
+            .map_err(|err| AuthForgeError::Other(format!("invalid_payload_json: {err}")))?;
+
+        if payload.nonce != expected_nonce {
+            return Err(AuthForgeError::ReplayDetected);
+        }
+
+        Ok(payload)
+    }
+
+    fn start_heartbeat_thread(&self) {
+        self.stop_heartbeat_thread();
+        self.inner.stop_signal.store(false, Ordering::SeqCst);
+
+        let client = self.clone();
+        let interval = self.inner.cfg.heartbeat_interval;
+        let handle = thread::spawn(move || {
+            while !client.inner.stop_signal.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_secs(interval));
+                if client.inner.stop_signal.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let heartbeat_result = match client.inner.cfg.heartbeat_mode {
+                    HeartbeatMode::Server => client.server_heartbeat_with_retry(),
+                    HeartbeatMode::Local => client.local_heartbeat_check()
+                };
+
+                if let Err(err) = heartbeat_result {
+                    {
+                        let mut state = client
+                            .inner
+                            .state
+                            .lock()
+                            .expect("authforge state mutex poisoned in heartbeat");
+                        state.authenticated = false;
+                    }
+                    if let Some(callback) = &client.inner.cfg.on_failure {
+                        let message = format!("{err:?}");
+                        callback(&message);
+                    }
+                    break;
+                }
+            }
+        });
+
+        let mut lock = self
+            .inner
+            .heartbeat_handle
+            .lock()
+            .expect("authforge heartbeat mutex poisoned in start_heartbeat_thread");
+        *lock = Some(handle);
+    }
+
+    fn stop_heartbeat_thread(&self) {
+        self.inner.stop_signal.store(true, Ordering::SeqCst);
+        if let Ok(mut handle_lock) = self.inner.heartbeat_handle.lock() {
+            if let Some(handle) = handle_lock.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+impl Clone for AuthForgeClient {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner)
+        }
+    }
+}
+
+impl Drop for AuthForgeClient {
+    fn drop(&mut self) {
+        self.stop_heartbeat_thread();
+    }
+}
+
+pub fn derive_signing_key(app_secret: &str, nonce: &str) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(app_secret.as_bytes());
+    hasher.update(nonce.as_bytes());
+    hasher.finalize().to_vec()
+}
+
+pub fn sign_payload(payload_base64: &str, key: &[u8]) -> Result<String, AuthForgeError> {
+    let mut mac = HmacSha256::new_from_slice(key)
+        .map_err(|err| AuthForgeError::Other(format!("hmac_init_failed: {err}")))?;
+    mac.update(payload_base64.as_bytes());
+    let bytes = mac.finalize().into_bytes();
+    Ok(hex_lower(&bytes))
+}
+
+fn parse_signed_response(body: String) -> Result<SignedResponse, AuthForgeError> {
+    serde_json::from_str::<SignedResponse>(&body)
+        .map_err(|err| AuthForgeError::NetworkError(format!("invalid_json_response: {err}")))
+}
+
+fn map_server_error(error: &str) -> AuthForgeError {
+    match error {
+        "invalid_app" => AuthForgeError::InvalidApp,
+        "app_disabled" => AuthForgeError::AppDisabled,
+        "invalid_key" => AuthForgeError::InvalidKey,
+        "expired" => AuthForgeError::Expired,
+        "session_expired" => AuthForgeError::SessionExpired,
+        "revoked" => AuthForgeError::Revoked,
+        "hwid_mismatch" => AuthForgeError::HwidMismatch,
+        "no_credits" => AuthForgeError::NoCredits,
+        "blocked" => AuthForgeError::Blocked,
+        "rate_limited" => AuthForgeError::RateLimited,
+        "replay_detected" => AuthForgeError::ReplayDetected,
+        "bad_request" => AuthForgeError::BadRequest,
+        "checksum_required" => AuthForgeError::ChecksumRequired,
+        "checksum_mismatch" => AuthForgeError::ChecksumMismatch,
+        _ => AuthForgeError::Other(error.to_string())
+    }
+}
+
+fn is_success_status(status: &Value) -> bool {
+    match status {
+        Value::Bool(value) => *value,
+        Value::String(value) => {
+            let text = value.trim().to_ascii_lowercase();
+            text == "ok" || text == "success" || text == "valid" || text == "true" || text == "1"
+        }
+        Value::Number(value) => value.as_i64() == Some(1),
+        _ => false
+    }
+}
+
+fn decode_base64_any(value: &str) -> Result<Vec<u8>, AuthForgeError> {
+    STANDARD
+        .decode(value)
+        .or_else(|_| URL_SAFE.decode(value))
+        .map_err(|err| AuthForgeError::Other(format!("payload_base64_decode_failed: {err}")))
+}
+
+fn generate_hwid() -> String {
+    let host = hostname::get()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .unwrap_or_else(|| "unknown-host".to_string());
+    let os = std::env::consts::OS.to_string();
+    let mac = mac_address::get_mac_address()
+        .ok()
+        .and_then(|value| value)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown-mac".to_string());
+
+    let material = format!("{host}|{os}|{mac}");
+    let mut hasher = Sha256::new();
+    hasher.update(material.as_bytes());
+    hex_lower(&hasher.finalize())
+}
+
+fn build_agent(timeout_secs: u64) -> Agent {
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+}
+
+fn generate_nonce() -> String {
+    let counter = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = epoch_now();
+    let seed = format!(
+        "{}:{}:{}:{}",
+        now,
+        counter,
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(seed.as_bytes());
+    hex_lower(&hasher.finalize())[..32].to_string()
+}
+
+fn epoch_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
+fn extract_nonce(value: &Value) -> Option<String> {
+    value
+        .get("nonce")
+        .and_then(Value::as_str)
+        .map(|nonce| nonce.to_string())
+}
+
+fn refresh_nonce(value: &mut Value) -> Option<String> {
+    let next_nonce = generate_nonce();
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("nonce".to_string(), Value::String(next_nonce.clone()));
+        return Some(next_nonce);
+    }
+    None
+}
+
+fn response_error_code(response: &SignedResponse) -> Option<String> {
+    if let Some(error) = &response.error {
+        let lower = error.trim().to_ascii_lowercase();
+        if !lower.is_empty() {
+            return Some(lower);
+        }
+    }
+
+    if let Value::String(status) = &response.status {
+        let lower = status.trim().to_ascii_lowercase();
+        if !lower.is_empty() {
+            return Some(lower);
+        }
+    }
+
+    None
+}

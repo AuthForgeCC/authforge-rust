@@ -1,0 +1,16 @@
+# Cargo build artifacts
+/target/
+
+# Library crate: lockfile is not committed (applications pin versions via their own lockfile).
+# If Cargo.lock was already tracked, run: git rm --cached Cargo.lock
+/Cargo.lock
+
+# rustfmt backups
+**/*.rs.bk
+
+# MSVC / Windows (rustc debug symbols)
+*.pdb
+
+# IDE / OS
+.DS_Store
+Thumbs.db
