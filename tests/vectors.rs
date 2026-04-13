@@ -23,8 +23,8 @@ struct VectorOutputs {
 }
 
 #[test]
-fn python_vector_matches_rust_crypto_outputs() {
-    let vectors = include_str!("../../AuthForge-PythonSDK/test_vectors.json");
+fn reference_vector_matches_rust_crypto_outputs() {
+    let vectors = include_str!("../test_vectors.json");
     let parsed: TestVectors = serde_json::from_str(vectors).expect("valid vector json");
 
     let key = derive_signing_key(&parsed.inputs.app_secret, &parsed.inputs.nonce);

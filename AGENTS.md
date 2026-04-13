@@ -9,7 +9,7 @@ AuthForge is a license key validation service. Your app sends a license key + ha
 
 ## Installation
 
-Add the crate to `Cargo.toml` as a git dependency (see repository README), or vendor the crate source into your workspace.
+The crate is not on crates.io. Add it via a **path** dependency to a local clone or copy, or a **git** URL you can reach (see repository README).
 
 ## Minimal working integration
 

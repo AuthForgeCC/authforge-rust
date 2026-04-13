@@ -4,19 +4,29 @@ Official Rust SDK for [AuthForge](https://authforge.cc) - license validation, HW
 
 ## Installation
 
-### crates.io (when published)
+This crate is **not** published on [crates.io](https://crates.io) yet. Add the SDK source to your project in one of these ways:
+
+### Path dependency (copy, clone, or submodule)
+
+Clone or download this repository and point your app at the crate directory from `Cargo.toml`:
 
 ```toml
 [dependencies]
-authforge = "0.1"
+authforge = { path = "../authforge-rust" }
 ```
 
+Adjust the path to match where you placed the SDK (for example `vendor/authforge`).
+
 ### Git dependency
+
+If you can reach the repository over Git (HTTPS, SSH, or self-hosted), depend on the crate without crates.io:
 
 ```toml
 [dependencies]
 authforge = { git = "https://github.com/AuthForgeCC/authforge-rust" }
 ```
+
+Use the URL you actually use to clone; if the repo is not public yet, prefer a **path dependency** until it is.
 
 ## Quick start
 
