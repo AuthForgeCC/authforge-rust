@@ -93,6 +93,7 @@ struct SessionState {
     authenticated: bool,
     license_key: Option<String>,
     session_token: Option<String>,
+    sig_key: Option<String>,
     expires_in: Option<u64>,
     session_data: Option<Value>,
     app_variables: Option<HashMap<String, Value>>,
@@ -104,11 +105,18 @@ impl SessionState {
         self.authenticated = false;
         self.license_key = None;
         self.session_token = None;
+        self.sig_key = None;
         self.expires_in = None;
         self.session_data = None;
         self.app_variables = None;
         self.license_variables = None;
     }
+}
+
+#[derive(Clone, Copy)]
+enum SigningContext {
+    Validate,
+    Heartbeat
 }
 
 struct ClientInner {
@@ -195,6 +203,7 @@ impl AuthForgeClient {
                 authenticated: false,
                 license_key: None,
                 session_token: None,
+                sig_key: None,
                 expires_in: None,
                 session_data: None,
                 app_variables: None,
@@ -275,8 +284,14 @@ impl AuthForgeClient {
         };
 
         let (response, used_nonce) = self.post_json("/auth/validate", &request)?;
-        let payload = self.verify_signed_response(response, used_nonce.as_deref().unwrap_or(nonce))?;
+        let payload = self.verify_signed_response(
+            response,
+            used_nonce.as_deref().unwrap_or(nonce),
+            SigningContext::Validate
+        )?;
         let request_id = payload.request_id.clone().unwrap_or_default();
+        let sig_key = extract_sig_key_from_session_token(&payload.session_token)
+            .ok_or_else(|| AuthForgeError::Other("missing_sigKey".to_string()))?;
 
         let mut state = self
             .inner
@@ -286,6 +301,7 @@ impl AuthForgeClient {
         state.authenticated = true;
         state.license_key = Some(license_key.to_string());
         state.session_token = Some(payload.session_token.clone());
+        state.sig_key = Some(sig_key);
         state.expires_in = Some(payload.expires_in);
         state.app_variables = payload.app_variables.clone();
         state.license_variables = payload.license_variables.clone();
@@ -324,11 +340,14 @@ impl AuthForgeClient {
         let (response, used_nonce) = self.post_json("/auth/heartbeat", &request)?;
         let payload = self.verify_signed_response(
             response,
-            used_nonce.as_deref().unwrap_or(&nonce)
+            used_nonce.as_deref().unwrap_or(&nonce),
+            SigningContext::Heartbeat
         )?;
         let session_data = serde_json::to_value(&payload).unwrap_or(Value::Null);
         let session_token = payload.session_token;
         let expires_in = payload.expires_in;
+        let sig_key = extract_sig_key_from_session_token(&session_token)
+            .ok_or_else(|| AuthForgeError::Other("missing_sigKey".to_string()))?;
         let mut state = self
             .inner
             .state
@@ -336,6 +355,7 @@ impl AuthForgeClient {
             .map_err(|_| AuthForgeError::Other("state_lock_failed".to_string()))?;
         state.authenticated = true;
         state.session_token = Some(session_token);
+        state.sig_key = Some(sig_key);
         state.expires_in = Some(expires_in);
         state.session_data = Some(session_data);
         Ok(())
@@ -387,18 +407,23 @@ impl AuthForgeClient {
             let response = agent.post(&url).send_json(request_value);
             match response {
                 Ok(resp) => {
+                    let status_code = resp.status();
                     let parsed = parse_signed_response(resp.into_string().unwrap_or_default())?;
-                    if response_error_code(&parsed).as_deref() == Some("rate_limited") && rate_attempt < 2 {
+                    let is_rate_limited = status_code == 429
+                        || response_error_code(&parsed).as_deref() == Some("rate_limited");
+                    if is_rate_limited && rate_attempt < 2 {
                         thread::sleep(Duration::from_secs(if rate_attempt == 0 { 2 } else { 5 }));
                         rate_attempt += 1;
                         continue;
                     }
                     return Ok((parsed, used_nonce));
                 }
-                Err(UreqError::Status(_, response)) => {
+                Err(UreqError::Status(status_code, response)) => {
                     let body_text = response.into_string().unwrap_or_default();
                     let parsed = parse_signed_response(body_text)?;
-                    if response_error_code(&parsed).as_deref() == Some("rate_limited") && rate_attempt < 2 {
+                    let is_rate_limited = status_code == 429
+                        || response_error_code(&parsed).as_deref() == Some("rate_limited");
+                    if is_rate_limited && rate_attempt < 2 {
                         thread::sleep(Duration::from_secs(if rate_attempt == 0 { 2 } else { 5 }));
                         rate_attempt += 1;
                         continue;
@@ -423,7 +448,8 @@ impl AuthForgeClient {
     fn verify_signed_response(
         &self,
         response: SignedResponse,
-        expected_nonce: &str
+        expected_nonce: &str,
+        context: SigningContext
     ) -> Result<SignedPayload, AuthForgeError> {
         if !is_success_status(&response.status) {
             let server_error = response.error.unwrap_or_else(|| "unknown_error".to_string());
@@ -437,7 +463,25 @@ impl AuthForgeClient {
             .signature
             .ok_or_else(|| AuthForgeError::Other("missing_signature".to_string()))?;
 
-        let derived_key = derive_signing_key(&self.inner.cfg.app_secret, expected_nonce);
+        let derived_key = match context {
+            SigningContext::Validate => {
+                derive_signing_key(&self.inner.cfg.app_secret, expected_nonce)
+            }
+            SigningContext::Heartbeat => {
+                let sig_key = {
+                    let state = self
+                        .inner
+                        .state
+                        .lock()
+                        .map_err(|_| AuthForgeError::Other("state_lock_failed".to_string()))?;
+                    state
+                        .sig_key
+                        .clone()
+                        .ok_or_else(|| AuthForgeError::Other("missing_sig_key".to_string()))?
+                };
+                derive_heartbeat_signing_key(&sig_key, expected_nonce)
+            }
+        };
         let expected_signature = sign_payload(&payload_b64, &derived_key)?;
         if signature.trim().to_ascii_lowercase() != expected_signature {
             return Err(AuthForgeError::SignatureMismatch);
@@ -527,6 +571,41 @@ pub fn derive_signing_key(app_secret: &str, nonce: &str) -> Vec<u8> {
     hasher.update(app_secret.as_bytes());
     hasher.update(nonce.as_bytes());
     hasher.finalize().to_vec()
+}
+
+pub fn derive_heartbeat_signing_key(sig_key: &str, nonce: &str) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(sig_key.as_bytes());
+    hasher.update(nonce.as_bytes());
+    hasher.finalize().to_vec()
+}
+
+fn extract_sig_key_from_session_token(session_token: &str) -> Option<String> {
+    let mut parts = session_token.splitn(2, '.');
+    let body_b64 = parts.next()?;
+    let padded = add_base64_padding(body_b64);
+    let normalized = padded.replace('-', "+").replace('_', "/");
+    let decoded = STANDARD.decode(normalized.as_bytes()).ok()?;
+    let body: Value = serde_json::from_slice(&decoded).ok()?;
+    body.get("sigKey")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn add_base64_padding(text: &str) -> String {
+    let remainder = text.len() % 4;
+    if remainder == 0 {
+        text.to_string()
+    } else {
+        let pad = 4 - remainder;
+        let mut out = String::with_capacity(text.len() + pad);
+        out.push_str(text);
+        for _ in 0..pad {
+            out.push('=');
+        }
+        out
+    }
 }
 
 pub fn sign_payload(payload_base64: &str, key: &[u8]) -> Result<String, AuthForgeError> {
