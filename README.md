@@ -37,6 +37,7 @@ fn main() {
     let client = AuthForgeClient::new(AuthForgeConfig {
         app_id: "your-app-id".into(),
         app_secret: "your-app-secret".into(),
+        public_key: "your-public-key".into(),
         heartbeat_mode: HeartbeatMode::Server,
         on_failure: Some(Box::new(|err| {
             eprintln!("Auth failed: {}", err);
@@ -58,6 +59,7 @@ fn main() {
 | --- | --- | --- | --- |
 | `app_id` | `String` | required | Application ID from the dashboard |
 | `app_secret` | `String` | required | Application secret from the dashboard |
+| `public_key` | `String` | required | App Ed25519 public key (base64) from dashboard |
 | `heartbeat_mode` | `HeartbeatMode` | `Local` | `Local` or `Server` heartbeat strategy |
 | `heartbeat_interval` | `u64` | `900` | Heartbeat interval in seconds |
 | `api_base_url` | `String` | `https://auth.authforge.cc` | API base URL |
@@ -94,8 +96,6 @@ Errors are returned as `AuthForgeError`, including:
 - `AppDisabled`
 - `SessionExpired`
 - `BadRequest`
-- `ChecksumRequired`
-- `ChecksumMismatch`
 - `SignatureMismatch`
 - `NetworkError(String)`
 - `Other(String)`

@@ -6,13 +6,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE};
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use ureq::{Agent, Error as UreqError};
-
-type HmacSha256 = Hmac<Sha256>;
 
 const DEFAULT_API_BASE_URL: &str = "https://auth.authforge.cc";
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -26,6 +24,7 @@ pub enum HeartbeatMode {
 pub struct AuthForgeConfig {
     pub app_id: String,
     pub app_secret: String,
+    pub public_key: String,
     pub heartbeat_mode: HeartbeatMode,
     pub heartbeat_interval: u64,
     pub api_base_url: String,
@@ -38,6 +37,7 @@ impl Default for AuthForgeConfig {
         Self {
             app_id: String::new(),
             app_secret: String::new(),
+            public_key: String::new(),
             heartbeat_mode: HeartbeatMode::Local,
             heartbeat_interval: 900,
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
@@ -64,14 +64,13 @@ pub enum AuthForgeError {
     Revoked,
     HwidMismatch,
     NoCredits,
+    AppBurnCapReached,
     Blocked,
     RateLimited,
     ReplayDetected,
     AppDisabled,
     SessionExpired,
     BadRequest,
-    ChecksumRequired,
-    ChecksumMismatch,
     SignatureMismatch,
     NetworkError(String),
     Other(String)
@@ -81,6 +80,7 @@ pub enum AuthForgeError {
 struct RuntimeConfig {
     app_id: String,
     app_secret: String,
+    public_key: String,
     heartbeat_mode: HeartbeatMode,
     heartbeat_interval: u64,
     api_base_url: String,
@@ -93,7 +93,6 @@ struct SessionState {
     authenticated: bool,
     license_key: Option<String>,
     session_token: Option<String>,
-    sig_key: Option<String>,
     expires_in: Option<u64>,
     session_data: Option<Value>,
     app_variables: Option<HashMap<String, Value>>,
@@ -105,7 +104,6 @@ impl SessionState {
         self.authenticated = false;
         self.license_key = None;
         self.session_token = None;
-        self.sig_key = None;
         self.expires_in = None;
         self.session_data = None;
         self.app_variables = None;
@@ -177,6 +175,7 @@ impl AuthForgeClient {
         let runtime_cfg = RuntimeConfig {
             app_id: config.app_id,
             app_secret: config.app_secret,
+            public_key: config.public_key,
             heartbeat_mode: config.heartbeat_mode,
             heartbeat_interval: if config.heartbeat_interval == 0 {
                 900
@@ -203,7 +202,6 @@ impl AuthForgeClient {
                 authenticated: false,
                 license_key: None,
                 session_token: None,
-                sig_key: None,
                 expires_in: None,
                 session_data: None,
                 app_variables: None,
@@ -219,7 +217,10 @@ impl AuthForgeClient {
     }
 
     pub fn login(&self, license_key: &str) -> Result<LoginResult, AuthForgeError> {
-        if self.inner.cfg.app_id.trim().is_empty() || self.inner.cfg.app_secret.trim().is_empty() {
+        if self.inner.cfg.app_id.trim().is_empty()
+            || self.inner.cfg.app_secret.trim().is_empty()
+            || self.inner.cfg.public_key.trim().is_empty()
+        {
             return Err(AuthForgeError::InvalidApp);
         }
         if license_key.trim().is_empty() {
@@ -290,8 +291,6 @@ impl AuthForgeClient {
             SigningContext::Validate
         )?;
         let request_id = payload.request_id.clone().unwrap_or_default();
-        let sig_key = extract_sig_key_from_session_token(&payload.session_token)
-            .ok_or_else(|| AuthForgeError::Other("missing_sigKey".to_string()))?;
 
         let mut state = self
             .inner
@@ -301,7 +300,6 @@ impl AuthForgeClient {
         state.authenticated = true;
         state.license_key = Some(license_key.to_string());
         state.session_token = Some(payload.session_token.clone());
-        state.sig_key = Some(sig_key);
         state.expires_in = Some(payload.expires_in);
         state.app_variables = payload.app_variables.clone();
         state.license_variables = payload.license_variables.clone();
@@ -346,8 +344,6 @@ impl AuthForgeClient {
         let session_data = serde_json::to_value(&payload).unwrap_or(Value::Null);
         let session_token = payload.session_token;
         let expires_in = payload.expires_in;
-        let sig_key = extract_sig_key_from_session_token(&session_token)
-            .ok_or_else(|| AuthForgeError::Other("missing_sigKey".to_string()))?;
         let mut state = self
             .inner
             .state
@@ -355,7 +351,6 @@ impl AuthForgeClient {
             .map_err(|_| AuthForgeError::Other("state_lock_failed".to_string()))?;
         state.authenticated = true;
         state.session_token = Some(session_token);
-        state.sig_key = Some(sig_key);
         state.expires_in = Some(expires_in);
         state.session_data = Some(session_data);
         Ok(())
@@ -463,27 +458,12 @@ impl AuthForgeClient {
             .signature
             .ok_or_else(|| AuthForgeError::Other("missing_signature".to_string()))?;
 
-        let derived_key = match context {
-            SigningContext::Validate => {
-                derive_signing_key(&self.inner.cfg.app_secret, expected_nonce)
-            }
-            SigningContext::Heartbeat => {
-                let sig_key = {
-                    let state = self
-                        .inner
-                        .state
-                        .lock()
-                        .map_err(|_| AuthForgeError::Other("state_lock_failed".to_string()))?;
-                    state
-                        .sig_key
-                        .clone()
-                        .ok_or_else(|| AuthForgeError::Other("missing_sig_key".to_string()))?
-                };
-                derive_heartbeat_signing_key(&sig_key, expected_nonce)
-            }
-        };
-        let expected_signature = sign_payload(&payload_b64, &derived_key)?;
-        if signature.trim().to_ascii_lowercase() != expected_signature {
+        _ = context;
+        if !verify_payload_signature_ed25519(
+            &payload_b64,
+            &signature,
+            &self.inner.cfg.public_key,
+        )? {
             return Err(AuthForgeError::SignatureMismatch);
         }
 
@@ -566,54 +546,31 @@ impl Drop for AuthForgeClient {
     }
 }
 
-pub fn derive_signing_key(app_secret: &str, nonce: &str) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(app_secret.as_bytes());
-    hasher.update(nonce.as_bytes());
-    hasher.finalize().to_vec()
-}
-
-pub fn derive_heartbeat_signing_key(sig_key: &str, nonce: &str) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(sig_key.as_bytes());
-    hasher.update(nonce.as_bytes());
-    hasher.finalize().to_vec()
-}
-
-fn extract_sig_key_from_session_token(session_token: &str) -> Option<String> {
-    let mut parts = session_token.splitn(2, '.');
-    let body_b64 = parts.next()?;
-    let padded = add_base64_padding(body_b64);
-    let normalized = padded.replace('-', "+").replace('_', "/");
-    let decoded = STANDARD.decode(normalized.as_bytes()).ok()?;
-    let body: Value = serde_json::from_slice(&decoded).ok()?;
-    body.get("sigKey")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-fn add_base64_padding(text: &str) -> String {
-    let remainder = text.len() % 4;
-    if remainder == 0 {
-        text.to_string()
-    } else {
-        let pad = 4 - remainder;
-        let mut out = String::with_capacity(text.len() + pad);
-        out.push_str(text);
-        for _ in 0..pad {
-            out.push('=');
-        }
-        out
+pub fn verify_payload_signature_ed25519(
+    payload_base64: &str,
+    signature_base64: &str,
+    public_key_base64: &str,
+) -> Result<bool, AuthForgeError> {
+    let public_key_bytes = decode_base64_any(public_key_base64)
+        .map_err(|err| AuthForgeError::Other(format!("public_key_base64_decode_failed: {err:?}")))?;
+    if public_key_bytes.len() != 32 {
+        return Err(AuthForgeError::Other("invalid_public_key_length".to_string()));
     }
-}
+    let key_array: [u8; 32] = public_key_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| AuthForgeError::Other("invalid_public_key_bytes".to_string()))?;
+    let verifying_key = VerifyingKey::from_bytes(&key_array)
+        .map_err(|err| AuthForgeError::Other(format!("invalid_public_key: {err}")))?;
 
-pub fn sign_payload(payload_base64: &str, key: &[u8]) -> Result<String, AuthForgeError> {
-    let mut mac = HmacSha256::new_from_slice(key)
-        .map_err(|err| AuthForgeError::Other(format!("hmac_init_failed: {err}")))?;
-    mac.update(payload_base64.as_bytes());
-    let bytes = mac.finalize().into_bytes();
-    Ok(hex_lower(&bytes))
+    let signature_bytes = decode_base64_any(signature_base64)
+        .map_err(|err| AuthForgeError::Other(format!("signature_base64_decode_failed: {err:?}")))?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|err| AuthForgeError::Other(format!("invalid_signature_bytes: {err}")))?;
+
+    Ok(verifying_key
+        .verify(payload_base64.as_bytes(), &signature)
+        .is_ok())
 }
 
 fn parse_signed_response(body: String) -> Result<SignedResponse, AuthForgeError> {
@@ -631,12 +588,11 @@ fn map_server_error(error: &str) -> AuthForgeError {
         "revoked" => AuthForgeError::Revoked,
         "hwid_mismatch" => AuthForgeError::HwidMismatch,
         "no_credits" => AuthForgeError::NoCredits,
+        "app_burn_cap_reached" => AuthForgeError::AppBurnCapReached,
         "blocked" => AuthForgeError::Blocked,
         "rate_limited" => AuthForgeError::RateLimited,
         "replay_detected" => AuthForgeError::ReplayDetected,
         "bad_request" => AuthForgeError::BadRequest,
-        "checksum_required" => AuthForgeError::ChecksumRequired,
-        "checksum_mismatch" => AuthForgeError::ChecksumMismatch,
         _ => AuthForgeError::Other(error.to_string())
     }
 }
