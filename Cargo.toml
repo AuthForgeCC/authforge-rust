@@ -1,9 +1,15 @@
 [package]
 name = "authforge"
-version = "2.0.0"
+version = "1.0.0"
 edition = "2021"
 description = "AuthForge SDK — license validation, HWID binding, and heartbeat verification"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/AuthForgeCC/authforge-rust"
+homepage = "https://authforge.cc"
+documentation = "https://docs.rs/authforge"
+keywords = ["authforge", "license", "licensing", "authentication", "hwid"]
+categories = ["authentication", "api-bindings"]
 
 [dependencies]
 sha2 = "0.10"

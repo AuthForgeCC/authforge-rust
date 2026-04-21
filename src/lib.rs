@@ -71,6 +71,7 @@ pub enum AuthForgeError {
     AppDisabled,
     SessionExpired,
     BadRequest,
+    SystemError,
     SignatureMismatch,
     NetworkError(String),
     Other(String)
@@ -593,6 +594,7 @@ fn map_server_error(error: &str) -> AuthForgeError {
         "rate_limited" => AuthForgeError::RateLimited,
         "replay_detected" => AuthForgeError::ReplayDetected,
         "bad_request" => AuthForgeError::BadRequest,
+        "system_error" => AuthForgeError::SystemError,
         _ => AuthForgeError::Other(error.to_string())
     }
 }
