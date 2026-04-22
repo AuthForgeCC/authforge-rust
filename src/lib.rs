@@ -15,6 +15,9 @@ use ureq::{Agent, Error as UreqError};
 const DEFAULT_API_BASE_URL: &str = "https://auth.authforge.cc";
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Thread-safe hook for logging or metrics when the SDK surfaces a failure string.
+pub type FailureCallback = dyn Fn(&str) + Send + Sync;
+
 #[derive(Debug, Clone)]
 pub enum HeartbeatMode {
     Local,
@@ -28,7 +31,7 @@ pub struct AuthForgeConfig {
     pub heartbeat_mode: HeartbeatMode,
     pub heartbeat_interval: u64,
     pub api_base_url: String,
-    pub on_failure: Option<Box<dyn Fn(&str) + Send + Sync>>,
+    pub on_failure: Option<Box<FailureCallback>>,
     pub request_timeout: u64,
     /// Requested session token lifetime (seconds) forwarded to `/auth/validate`.
     /// `None` means "use the server default" (24h today). Server clamps to
@@ -91,7 +94,7 @@ struct RuntimeConfig {
     heartbeat_interval: u64,
     api_base_url: String,
     request_timeout: u64,
-    on_failure: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    on_failure: Option<Arc<FailureCallback>>,
     session_ttl_seconds: Option<u64>
 }
 
@@ -180,7 +183,7 @@ struct HeartbeatRequest<'a> {
 
 impl AuthForgeClient {
     pub fn new(config: AuthForgeConfig) -> Self {
-        let on_failure = config.on_failure.map(Arc::<dyn Fn(&str) + Send + Sync>::from);
+        let on_failure = config.on_failure.map(Arc::<FailureCallback>::from);
         let runtime_cfg = RuntimeConfig {
             app_id: config.app_id,
             app_secret: config.app_secret,
