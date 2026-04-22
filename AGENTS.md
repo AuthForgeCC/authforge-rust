@@ -7,6 +7,12 @@
 
 AuthForge is a license key validation service. Your app sends a license key + hardware ID to the AuthForge API, gets back a cryptographically signed response, and runs background heartbeats to maintain the session. If the license is revoked or expired, the heartbeat fails and you handle it (typically exit the app).
 
+## Billing model (so you can pick sensible intervals)
+
+- **1 `login()` = 1 credit** (one `/auth/validate` debit).
+- **10 heartbeats = 1 credit** (billed on every 10th successful heartbeat per license).
+- Any `heartbeat_interval` is safe — from `1` (server apps) to `900` (15 min, desktop apps). Revocations always take effect on the **next** heartbeat regardless of interval.
+
 ## Installation
 
 The crate is not on crates.io. Add it via a **path** dependency to a local clone or copy, or a **git** URL you can reach (see repository README).
@@ -59,10 +65,11 @@ fn run_app() {
 | `app_id` | `String` | yes | empty | Application ID |
 | `app_secret` | `String` | yes | empty | Application secret |
 | `heartbeat_mode` | `HeartbeatMode` | yes | `Local` | `HeartbeatMode::Server` or `HeartbeatMode::Local` |
-| `heartbeat_interval` | `u64` | no | `900` | Seconds between heartbeats (`0` coerced to `900`) |
+| `heartbeat_interval` | `u64` | no | `900` | Seconds between heartbeats (any value ≥ 1; `0` coerced to `900`) |
 | `api_base_url` | `String` | no | `https://auth.authforge.cc` | API base URL |
 | `on_failure` | `Option<Box<dyn Fn(&str) + Send + Sync>>` | no | `None` | Invoked on heartbeat/auth failure with a diagnostic string |
 | `request_timeout` | `u64` | no | `15` | HTTP timeout seconds (`0` → `15`) |
+| `session_ttl_seconds` | `Option<u64>` | no | `None` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]`; preserved across heartbeat refreshes. |
 
 ## Methods
 
@@ -80,6 +87,9 @@ fn run_app() {
 invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, blocked, rate_limited, replay_detected, session_expired, app_disabled, bad_request
 
 (Maps to `AuthForgeError` variants and `AuthForgeError::Other(String)` for unknown strings.)
+
+Notes:
+- `rate_limited` and `replay_detected` can only be returned from `/auth/validate`. Heartbeats are not IP rate-limited and do not enforce nonce replay.
 
 ## Common patterns
 

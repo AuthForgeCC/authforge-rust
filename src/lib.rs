@@ -29,7 +29,11 @@ pub struct AuthForgeConfig {
     pub heartbeat_interval: u64,
     pub api_base_url: String,
     pub on_failure: Option<Box<dyn Fn(&str) + Send + Sync>>,
-    pub request_timeout: u64
+    pub request_timeout: u64,
+    /// Requested session token lifetime (seconds) forwarded to `/auth/validate`.
+    /// `None` means "use the server default" (24h today). Server clamps to
+    /// `[3600, 604800]`; out-of-range values are silently clamped.
+    pub session_ttl_seconds: Option<u64>
 }
 
 impl Default for AuthForgeConfig {
@@ -42,7 +46,8 @@ impl Default for AuthForgeConfig {
             heartbeat_interval: 900,
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
             on_failure: None,
-            request_timeout: 15
+            request_timeout: 15,
+            session_ttl_seconds: None
         }
     }
 }
@@ -86,7 +91,8 @@ struct RuntimeConfig {
     heartbeat_interval: u64,
     api_base_url: String,
     request_timeout: u64,
-    on_failure: Option<Arc<dyn Fn(&str) + Send + Sync>>
+    on_failure: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    session_ttl_seconds: Option<u64>
 }
 
 #[derive(Debug, Clone)]
@@ -158,7 +164,9 @@ struct ValidateRequest<'a> {
     app_secret: &'a str,
     license_key: &'a str,
     hwid: &'a str,
-    nonce: &'a str
+    nonce: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl_seconds: Option<u64>
 }
 
 #[derive(Deserialize, Serialize)]
@@ -193,7 +201,8 @@ impl AuthForgeClient {
             } else {
                 config.request_timeout
             },
-            on_failure
+            on_failure,
+            session_ttl_seconds: config.session_ttl_seconds
         };
 
         let inner = ClientInner {
@@ -282,7 +291,8 @@ impl AuthForgeClient {
             app_secret: &self.inner.cfg.app_secret,
             license_key,
             hwid: &self.inner.hwid,
-            nonce
+            nonce,
+            ttl_seconds: self.inner.cfg.session_ttl_seconds
         };
 
         let (response, used_nonce) = self.post_json("/auth/validate", &request)?;

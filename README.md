@@ -61,10 +61,18 @@ fn main() {
 | `app_secret` | `String` | required | Application secret from the dashboard |
 | `public_key` | `String` | required | App Ed25519 public key (base64) from dashboard |
 | `heartbeat_mode` | `HeartbeatMode` | `Local` | `Local` or `Server` heartbeat strategy |
-| `heartbeat_interval` | `u64` | `900` | Heartbeat interval in seconds |
+| `heartbeat_interval` | `u64` | `900` | Heartbeat interval in seconds (any value ≥ 1; default 15 min) |
 | `api_base_url` | `String` | `https://auth.authforge.cc` | API base URL |
 | `on_failure` | `Option<Box<dyn Fn(&str)+Send+Sync>>` | `None` | Callback invoked when auth fails |
 | `request_timeout` | `u64` | `15` | Request timeout in seconds |
+| `session_ttl_seconds` | `Option<u64>` | `None` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]`; preserved across heartbeat refreshes. |
+
+## Billing
+
+- **1 `login()` call = 1 credit** (one `/auth/validate` debit).
+- **10 heartbeats on the same license = 1 credit** (billed every 10th successful heartbeat).
+
+A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. A server app running 24/7 at a 1-minute interval burns ~145 credits/day — pick the interval based on how fast you need revocations to propagate (they always land on the **next** heartbeat).
 
 ## Methods
 
