@@ -15,7 +15,7 @@ AuthForge is a license key validation service. Your app sends a license key + ha
 
 ## Installation
 
-The crate is not on crates.io. Add it via a **path** dependency to a local clone or copy, or a **git** URL you can reach (see repository README).
+The crate is **`authforge`** on [crates.io](https://crates.io/crates/authforge). Prefer `cargo add authforge` or a semver dependency in `Cargo.toml`. For git or path dependencies, see the repository README.
 
 ## Minimal working integration
 

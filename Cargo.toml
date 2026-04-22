@@ -1,6 +1,6 @@
 [package]
 name = "authforge"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "AuthForge SDK — license validation, HWID binding, and heartbeat verification"
 license = "MIT"
