@@ -12,10 +12,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify tag matches Cargo.toml version
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/v}"
-          CARGO=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          TAG="${TAG//$'\r'/}"
+          # Use cargo metadata so we read the real crate version (avoids CRLF / grep hitting the wrong line).
+          CARGO=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "authforge") | .version')
           if [ "$TAG" != "$CARGO" ]; then
-            echo "Tag v$TAG does not match Cargo.toml version $CARGO"
+            echo "Tag v$TAG does not match crate version $CARGO"
             exit 1
           fi
       - name: Test
