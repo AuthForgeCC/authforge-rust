@@ -36,7 +36,8 @@ pub struct AuthForgeConfig {
     /// Requested session token lifetime (seconds) forwarded to `/auth/validate`.
     /// `None` means "use the server default" (24h today). Server clamps to
     /// `[3600, 604800]`; out-of-range values are silently clamped.
-    pub session_ttl_seconds: Option<u64>
+    pub session_ttl_seconds: Option<u64>,
+    pub hwid_override: Option<String>
 }
 
 impl Default for AuthForgeConfig {
@@ -50,7 +51,8 @@ impl Default for AuthForgeConfig {
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
             on_failure: None,
             request_timeout: 15,
-            session_ttl_seconds: None
+            session_ttl_seconds: None,
+            hwid_override: None
         }
     }
 }
@@ -78,6 +80,7 @@ pub enum AuthForgeError {
     ReplayDetected,
     AppDisabled,
     SessionExpired,
+    RevokeRequiresSession,
     BadRequest,
     SystemError,
     SignatureMismatch,
@@ -181,6 +184,30 @@ struct HeartbeatRequest<'a> {
     hwid: &'a str
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SelfBanPreSessionRequest<'a> {
+    app_id: &'a str,
+    app_secret: &'a str,
+    license_key: &'a str,
+    hwid: &'a str,
+    nonce: &'a str,
+    revoke_license: bool,
+    blacklist_hwid: bool,
+    blacklist_ip: bool
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SelfBanPostSessionRequest<'a> {
+    app_id: &'a str,
+    session_token: &'a str,
+    hwid: &'a str,
+    revoke_license: bool,
+    blacklist_hwid: bool,
+    blacklist_ip: bool
+}
+
 impl AuthForgeClient {
     pub fn new(config: AuthForgeConfig) -> Self {
         let on_failure = config.on_failure.map(Arc::<FailureCallback>::from);
@@ -210,7 +237,7 @@ impl AuthForgeClient {
 
         let inner = ClientInner {
             cfg: runtime_cfg,
-            hwid: generate_hwid(),
+            hwid: resolve_hwid(config.hwid_override),
             state: Arc::new(Mutex::new(SessionState {
                 authenticated: false,
                 license_key: None,
@@ -244,6 +271,71 @@ impl AuthForgeClient {
         let result = self.validate_once(license_key, &nonce)?;
         self.start_heartbeat_thread();
         Ok(result)
+    }
+
+    pub fn self_ban(
+        &self,
+        license_key: Option<&str>,
+        session_token: Option<&str>,
+        revoke_license: bool,
+        blacklist_hwid: bool,
+        blacklist_ip: bool
+    ) -> Result<(), AuthForgeError> {
+        let (current_session, current_license) = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| AuthForgeError::Other("state_lock_failed".to_string()))?;
+            (state.session_token.clone(), state.license_key.clone())
+        };
+
+        let resolved_session = session_token
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .or(current_session);
+        if let Some(session) = resolved_session {
+            let request = SelfBanPostSessionRequest {
+                app_id: &self.inner.cfg.app_id,
+                session_token: &session,
+                hwid: &self.inner.hwid,
+                revoke_license,
+                blacklist_hwid,
+                blacklist_ip
+            };
+            let (response, _) = self.post_json("/auth/selfban", &request)?;
+            if !is_success_status(&response.status) {
+                let code = response.error.unwrap_or_else(|| "unknown_error".to_string());
+                return Err(map_server_error(&code));
+            }
+            return Ok(());
+        }
+
+        let resolved_license = license_key
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .or(current_license)
+            .ok_or_else(|| AuthForgeError::Other("missing_license_key".to_string()))?;
+        let nonce = generate_nonce();
+        let request = SelfBanPreSessionRequest {
+            app_id: &self.inner.cfg.app_id,
+            app_secret: &self.inner.cfg.app_secret,
+            license_key: &resolved_license,
+            hwid: &self.inner.hwid,
+            nonce: &nonce,
+            // Pre-session self-ban cannot revoke licenses.
+            revoke_license: false,
+            blacklist_hwid,
+            blacklist_ip
+        };
+        let (response, _) = self.post_json("/auth/selfban", &request)?;
+        if !is_success_status(&response.status) {
+            let code = response.error.unwrap_or_else(|| "unknown_error".to_string());
+            return Err(map_server_error(&code));
+        }
+        Ok(())
     }
 
     pub fn logout(&self) {
@@ -606,6 +698,7 @@ fn map_server_error(error: &str) -> AuthForgeError {
         "blocked" => AuthForgeError::Blocked,
         "rate_limited" => AuthForgeError::RateLimited,
         "replay_detected" => AuthForgeError::ReplayDetected,
+        "revoke_requires_session" => AuthForgeError::RevokeRequiresSession,
         "bad_request" => AuthForgeError::BadRequest,
         "system_error" => AuthForgeError::SystemError,
         _ => AuthForgeError::Other(error.to_string())
@@ -647,6 +740,16 @@ fn generate_hwid() -> String {
     let mut hasher = Sha256::new();
     hasher.update(material.as_bytes());
     hex_lower(&hasher.finalize())
+}
+
+fn resolve_hwid(hwid_override: Option<String>) -> String {
+    if let Some(value) = hwid_override {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    generate_hwid()
 }
 
 fn build_agent(timeout_secs: u64) -> Agent {

@@ -70,6 +70,9 @@ fn run_app() {
 | `on_failure` | `Option<Box<dyn Fn(&str) + Send + Sync>>` | no | `None` | Invoked on heartbeat/auth failure with a diagnostic string |
 | `request_timeout` | `u64` | no | `15` | HTTP timeout seconds (`0` → `15`) |
 | `session_ttl_seconds` | `Option<u64>` | no | `None` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]`; preserved across heartbeat refreshes. |
+| `hwid_override` | `Option<String>` | no | `None` | Optional custom HWID/subject string. When set to `Some(non-empty)` (for example `tg:123456789`), the SDK sends it instead of generating a machine fingerprint. |
+
+For Telegram/Discord bot flows, prefer immutable IDs (`tg:<user_id>`, `discord:<user_id>`) instead of usernames.
 
 ## Methods
 
