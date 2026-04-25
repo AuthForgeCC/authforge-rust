@@ -9,7 +9,7 @@ AuthForge is a license key validation service. Your app sends a license key + ha
 
 ## Billing model (so you can pick sensible intervals)
 
-- **1 `login()` = 1 credit** (one `/auth/validate` debit).
+- **1 `login()` or `validate_license()` = 1 credit** (one `/auth/validate` debit each).
 - **10 heartbeats = 1 credit** (billed on every 10th successful heartbeat per license).
 - Any `heartbeat_interval` is safe — from `1` (server apps) to `900` (15 min, desktop apps). Revocations always take effect on the **next** heartbeat regardless of interval.
 
@@ -67,7 +67,7 @@ fn run_app() {
 | `heartbeat_mode` | `HeartbeatMode` | yes | `Local` | `HeartbeatMode::Server` or `HeartbeatMode::Local` |
 | `heartbeat_interval` | `u64` | no | `900` | Seconds between heartbeats (any value ≥ 1; `0` coerced to `900`) |
 | `api_base_url` | `String` | no | `https://auth.authforge.cc` | API base URL |
-| `on_failure` | `Option<Box<dyn Fn(&str) + Send + Sync>>` | no | `None` | Invoked on heartbeat/auth failure with a diagnostic string |
+| `on_failure` | `Option<Box<dyn Fn(&str) + Send + Sync>>` | no | `None` | Invoked on heartbeat failure (and `login` network failure after retry); **not** invoked for `validate_license` network errors |
 | `request_timeout` | `u64` | no | `15` | HTTP timeout seconds (`0` → `15`) |
 | `session_ttl_seconds` | `Option<u64>` | no | `None` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]`; preserved across heartbeat refreshes. |
 | `hwid_override` | `Option<String>` | no | `None` | Optional custom HWID/subject string. When set to `Some(non-empty)` (for example `tg:123456789`), the SDK sends it instead of generating a machine fingerprint. |
@@ -79,6 +79,7 @@ For Telegram/Discord bot flows, prefer immutable IDs (`tg:<user_id>`, `discord:<
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `login(&self, license_key: &str)` | `Result<LoginResult, AuthForgeError>` | Validates license and starts heartbeat |
+| `validate_license(&self, license_key: &str)` | `Result<LoginResult, AuthForgeError>` | Same validate + signatures; no session/heartbeat; no `on_failure` on transport failure |
 | `logout(&self)` | `()` | Stops heartbeat and clears state |
 | `is_authenticated(&self)` | `bool` | Whether authenticated |
 | `get_session_data(&self)` | `Option<serde_json::Value>` | Session payload |
@@ -112,7 +113,7 @@ client.logout();
 
 ### Custom error handling
 
-Handle `AuthForgeError` from `login`; heartbeat failures invoke `on_failure` with a `Debug` string of the error.
+Handle `AuthForgeError` from `login` or `validate_license`; heartbeat failures invoke `on_failure` with a `Debug` string of the error. `validate_license` transport failures return `Err(NetworkError)` without calling `on_failure`.
 
 ## Do NOT
 

@@ -267,9 +267,28 @@ impl AuthForgeClient {
             return Err(AuthForgeError::InvalidKey);
         }
 
-        let nonce = generate_nonce();
-        let result = self.validate_once(license_key, &nonce)?;
+        let result = self.validate_once(license_key)?;
         self.start_heartbeat_thread();
+        Ok(result)
+    }
+
+    /// Same `/auth/validate` request and signature verification as [`Self::login`], without
+    /// updating session state or starting the heartbeat thread.
+    ///
+    /// On transport failure after retries, returns [`AuthForgeError::NetworkError`] without
+    /// invoking `on_failure` (unlike [`Self::login`], which uses the network-failure hook).
+    pub fn validate_license(&self, license_key: &str) -> Result<LoginResult, AuthForgeError> {
+        if self.inner.cfg.app_id.trim().is_empty()
+            || self.inner.cfg.app_secret.trim().is_empty()
+            || self.inner.cfg.public_key.trim().is_empty()
+        {
+            return Err(AuthForgeError::InvalidApp);
+        }
+        if license_key.trim().is_empty() {
+            return Err(AuthForgeError::InvalidKey);
+        }
+
+        let (result, _) = self.validate_payload_only(license_key, false)?;
         Ok(result)
     }
 
@@ -304,7 +323,7 @@ impl AuthForgeClient {
                 blacklist_hwid,
                 blacklist_ip
             };
-            let (response, _) = self.post_json("/auth/selfban", &request)?;
+            let (response, _) = self.post_json("/auth/selfban", &request, true)?;
             if !is_success_status(&response.status) {
                 let code = response.error.unwrap_or_else(|| "unknown_error".to_string());
                 return Err(map_server_error(&code));
@@ -330,7 +349,7 @@ impl AuthForgeClient {
             blacklist_hwid,
             blacklist_ip
         };
-        let (response, _) = self.post_json("/auth/selfban", &request)?;
+        let (response, _) = self.post_json("/auth/selfban", &request, true)?;
         if !is_success_status(&response.status) {
             let code = response.error.unwrap_or_else(|| "unknown_error".to_string());
             return Err(map_server_error(&code));
@@ -380,23 +399,42 @@ impl AuthForgeClient {
             .and_then(|state| state.license_variables.clone())
     }
 
-    fn validate_once(&self, license_key: &str, nonce: &str) -> Result<LoginResult, AuthForgeError> {
+    fn validate_payload_only(
+        &self,
+        license_key: &str,
+        invoke_on_network_failure: bool
+    ) -> Result<(LoginResult, SignedPayload), AuthForgeError> {
+        let nonce = generate_nonce();
         let request = ValidateRequest {
             app_id: &self.inner.cfg.app_id,
             app_secret: &self.inner.cfg.app_secret,
             license_key,
             hwid: &self.inner.hwid,
-            nonce,
+            nonce: &nonce,
             ttl_seconds: self.inner.cfg.session_ttl_seconds
         };
 
-        let (response, used_nonce) = self.post_json("/auth/validate", &request)?;
+        let (response, used_nonce) =
+            self.post_json("/auth/validate", &request, invoke_on_network_failure)?;
         let payload = self.verify_signed_response(
             response,
-            used_nonce.as_deref().unwrap_or(nonce),
+            used_nonce.as_deref().unwrap_or(&nonce),
             SigningContext::Validate
         )?;
         let request_id = payload.request_id.clone().unwrap_or_default();
+
+        let result = LoginResult {
+            session_token: payload.session_token.clone(),
+            expires_in: payload.expires_in,
+            app_variables: payload.app_variables.clone(),
+            license_variables: payload.license_variables.clone(),
+            request_id
+        };
+        Ok((result, payload))
+    }
+
+    fn validate_once(&self, license_key: &str) -> Result<LoginResult, AuthForgeError> {
+        let (result, payload) = self.validate_payload_only(license_key, true)?;
 
         let mut state = self
             .inner
@@ -411,13 +449,7 @@ impl AuthForgeClient {
         state.license_variables = payload.license_variables.clone();
         state.session_data = Some(serde_json::to_value(&payload).unwrap_or(Value::Null));
 
-        Ok(LoginResult {
-            session_token: payload.session_token,
-            expires_in: payload.expires_in,
-            app_variables: payload.app_variables,
-            license_variables: payload.license_variables,
-            request_id
-        })
+        Ok(result)
     }
 
     fn server_heartbeat_with_retry(&self) -> Result<(), AuthForgeError> {
@@ -441,7 +473,7 @@ impl AuthForgeClient {
             hwid: &self.inner.hwid
         };
 
-        let (response, used_nonce) = self.post_json("/auth/heartbeat", &request)?;
+        let (response, used_nonce) = self.post_json("/auth/heartbeat", &request, true)?;
         let payload = self.verify_signed_response(
             response,
             used_nonce.as_deref().unwrap_or(&nonce),
@@ -488,7 +520,8 @@ impl AuthForgeClient {
     fn post_json<T: Serialize>(
         &self,
         path: &str,
-        body: &T
+        body: &T,
+        invoke_on_network_failure: bool
     ) -> Result<(SignedResponse, Option<String>), AuthForgeError> {
         let agent = build_agent(self.inner.cfg.request_timeout);
         let url = format!("{}{}", self.inner.cfg.api_base_url, path);
@@ -537,8 +570,10 @@ impl AuthForgeClient {
                         thread::sleep(Duration::from_secs(2));
                         continue;
                     }
-                    if let Some(callback) = &self.inner.cfg.on_failure {
-                        callback("network_error");
+                    if invoke_on_network_failure {
+                        if let Some(callback) = &self.inner.cfg.on_failure {
+                            callback("network_error");
+                        }
                     }
                     return Err(AuthForgeError::NetworkError(err.to_string()));
                 }
@@ -652,6 +687,84 @@ impl Drop for AuthForgeClient {
     }
 }
 
+#[cfg(test)]
+mod validate_license_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    #[test]
+    fn validate_license_success_and_error_leave_session_inactive() {
+        let raw = include_str!("../test_vectors.json");
+        let vectors: Value = serde_json::from_str(raw).expect("vectors");
+        let cases = vectors["cases"].as_array().expect("cases");
+        let success = cases
+            .iter()
+            .find(|c| c["id"] == "validate_success")
+            .expect("validate_success");
+        let public_key = vectors["publicKey"].as_str().unwrap();
+
+        let run_server = |body: String| {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = mpsc::channel::<()>();
+            thread::spawn(move || {
+                let _ = tx.send(());
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(2))
+                .expect("server thread started");
+            addr
+        };
+
+        let ok_body = serde_json::json!({
+            "status": "ok",
+            "payload": success["payload"],
+            "signature": success["signature"],
+            "keyId": "signing-key-1",
+        })
+        .to_string();
+        let addr_ok = run_server(ok_body);
+        std::env::set_var("AUTHFORGE_SDK_TEST_NONCE", "nonce-validate-001");
+        let client_ok = AuthForgeClient::new(AuthForgeConfig {
+            app_id: "app".into(),
+            app_secret: "secret".into(),
+            public_key: public_key.into(),
+            heartbeat_mode: HeartbeatMode::Local,
+            api_base_url: format!("http://{}", addr_ok),
+            ..Default::default()
+        });
+        let result = client_ok.validate_license("key").expect("validate");
+        assert_eq!(result.session_token, "session.validate.token");
+        assert!(!client_ok.is_authenticated());
+        std::env::remove_var("AUTHFORGE_SDK_TEST_NONCE");
+
+        let err_body = r#"{"status":"invalid_key","error":"invalid_key"}"#.to_string();
+        let addr_err = run_server(err_body);
+        let client_err = AuthForgeClient::new(AuthForgeConfig {
+            app_id: "app".into(),
+            app_secret: "secret".into(),
+            public_key: "0wRcYWn44wk9tHOisXgso1wbtUqpFdy0IeMk4HXDiNc=".into(),
+            heartbeat_mode: HeartbeatMode::Local,
+            api_base_url: format!("http://{}", addr_err),
+            ..Default::default()
+        });
+        let err = client_err.validate_license("bad").unwrap_err();
+        assert!(matches!(err, AuthForgeError::InvalidKey), "{err:?}");
+        assert!(!client_err.is_authenticated());
+    }
+}
+
 pub fn verify_payload_signature_ed25519(
     payload_base64: &str,
     signature_base64: &str,
@@ -759,6 +872,14 @@ fn build_agent(timeout_secs: u64) -> Agent {
 }
 
 fn generate_nonce() -> String {
+    #[cfg(test)]
+    if let Ok(v) = std::env::var("AUTHFORGE_SDK_TEST_NONCE") {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
     let counter = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let now = epoch_now();
     let seed = format!(

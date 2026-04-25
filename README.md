@@ -96,7 +96,7 @@ let client = AuthForgeClient::new(AuthForgeConfig {
 
 ## Billing
 
-- **1 `login()` call = 1 credit** (one `/auth/validate` debit).
+- **1 `login()` or `validate_license()` call = 1 credit** (one `/auth/validate` debit each).
 - **10 heartbeats on the same license = 1 credit** (billed every 10th successful heartbeat).
 
 A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. A server app running 24/7 at a 1-minute interval burns ~145 credits/day — pick the interval based on how fast you need revocations to propagate (they always land on the **next** heartbeat).
@@ -104,6 +104,7 @@ A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. A
 ## Methods
 
 - `login(&self, license_key: &str) -> Result<LoginResult, AuthForgeError>`
+- `validate_license(&self, license_key: &str) -> Result<LoginResult, AuthForgeError>` — same `/auth/validate` + verification as `login`, without storing session or starting heartbeat; **`on_failure` is not called** for network errors on this path
 - `self_ban(&self, license_key: Option<&str>, session_token: Option<&str>, revoke_license: bool, blacklist_hwid: bool, blacklist_ip: bool) -> Result<(), AuthForgeError>`
 - `logout(&self)`
 - `is_authenticated(&self) -> bool`
