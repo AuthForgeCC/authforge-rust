@@ -1,4 +1,4 @@
-use authforge::verify_payload_signature_ed25519;
+use authforge::{verify_payload_signature_ed25519, verify_payload_signature_ed25519_any};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -44,5 +44,22 @@ fn vector_cases_match_expected_verification_result() {
             "vector case '{}' verification mismatch",
             vector.id
         );
+    }
+}
+
+// During a server-side rotation a deployment can be configured with the
+// previous and current keys; verification has to walk the full list.
+#[test]
+fn multi_key_accepts_any_match() {
+    let vectors = load_vectors();
+    let trust_list: Vec<String> = vec![
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+        vectors.public_key.clone(),
+    ];
+    for vector in vectors.cases.iter().filter(|v| v.should_verify) {
+        let verified =
+            verify_payload_signature_ed25519_any(&vector.payload, &vector.signature, &trust_list)
+                .expect("verification should run");
+        assert!(verified, "multi-key verify rejected vector '{}'", vector.id);
     }
 }

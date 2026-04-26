@@ -27,7 +27,15 @@ pub enum HeartbeatMode {
 pub struct AuthForgeConfig {
     pub app_id: String,
     pub app_secret: String,
+    /// Trusted Ed25519 public key in base64. Use `public_keys` instead for
+    /// rotation set support; `public_key` remains for the single-key
+    /// historical contract and is merged into the trust list at construction.
     pub public_key: String,
+    /// Optional rotation set. When non-empty its entries are merged ahead of
+    /// `public_key` so the SDK trusts both the previous and the current
+    /// server-side key during a cutover. A signature that matches *any*
+    /// entry verifies successfully.
+    pub public_keys: Vec<String>,
     pub heartbeat_mode: HeartbeatMode,
     pub heartbeat_interval: u64,
     pub api_base_url: String,
@@ -46,6 +54,7 @@ impl Default for AuthForgeConfig {
             app_id: String::new(),
             app_secret: String::new(),
             public_key: String::new(),
+            public_keys: Vec::new(),
             heartbeat_mode: HeartbeatMode::Local,
             heartbeat_interval: 900,
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
@@ -92,7 +101,8 @@ pub enum AuthForgeError {
 struct RuntimeConfig {
     app_id: String,
     app_secret: String,
-    public_key: String,
+    /// Canonical trust list — never empty after construction.
+    public_keys: Vec<String>,
     heartbeat_mode: HeartbeatMode,
     heartbeat_interval: u64,
     api_base_url: String,
@@ -211,10 +221,11 @@ struct SelfBanPostSessionRequest<'a> {
 impl AuthForgeClient {
     pub fn new(config: AuthForgeConfig) -> Self {
         let on_failure = config.on_failure.map(Arc::<FailureCallback>::from);
+        let public_keys = collect_public_keys(&config.public_keys, &config.public_key);
         let runtime_cfg = RuntimeConfig {
             app_id: config.app_id,
             app_secret: config.app_secret,
-            public_key: config.public_key,
+            public_keys,
             heartbeat_mode: config.heartbeat_mode,
             heartbeat_interval: if config.heartbeat_interval == 0 {
                 900
@@ -259,7 +270,7 @@ impl AuthForgeClient {
     pub fn login(&self, license_key: &str) -> Result<LoginResult, AuthForgeError> {
         if self.inner.cfg.app_id.trim().is_empty()
             || self.inner.cfg.app_secret.trim().is_empty()
-            || self.inner.cfg.public_key.trim().is_empty()
+            || self.inner.cfg.public_keys.is_empty()
         {
             return Err(AuthForgeError::InvalidApp);
         }
@@ -280,7 +291,7 @@ impl AuthForgeClient {
     pub fn validate_license(&self, license_key: &str) -> Result<LoginResult, AuthForgeError> {
         if self.inner.cfg.app_id.trim().is_empty()
             || self.inner.cfg.app_secret.trim().is_empty()
-            || self.inner.cfg.public_key.trim().is_empty()
+            || self.inner.cfg.public_keys.is_empty()
         {
             return Err(AuthForgeError::InvalidApp);
         }
@@ -600,10 +611,10 @@ impl AuthForgeClient {
             .ok_or_else(|| AuthForgeError::Other("missing_signature".to_string()))?;
 
         _ = context;
-        if !verify_payload_signature_ed25519(
+        if !verify_payload_signature_ed25519_any(
             &payload_b64,
             &signature,
-            &self.inner.cfg.public_key,
+            &self.inner.cfg.public_keys,
         )? {
             return Err(AuthForgeError::SignatureMismatch);
         }
@@ -749,6 +760,35 @@ mod validate_license_tests {
         assert!(!client_ok.is_authenticated());
         std::env::remove_var("AUTHFORGE_SDK_TEST_NONCE");
 
+        // Rotation set: bogus key first, real key second. validate_license
+        // must succeed because the *second* key in the trust list matches
+        // the server's signature — exercising the multi-key fallback path.
+        let ok_body_rotation = serde_json::json!({
+            "status": "ok",
+            "payload": success["payload"],
+            "signature": success["signature"],
+            "keyId": "signing-key-1",
+        })
+        .to_string();
+        let addr_rotation = run_server(ok_body_rotation);
+        std::env::set_var("AUTHFORGE_SDK_TEST_NONCE", "nonce-validate-001");
+        let client_rotation = AuthForgeClient::new(AuthForgeConfig {
+            app_id: "app".into(),
+            app_secret: "secret".into(),
+            public_keys: vec![
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                public_key.into(),
+            ],
+            heartbeat_mode: HeartbeatMode::Local,
+            api_base_url: format!("http://{}", addr_rotation),
+            ..Default::default()
+        });
+        let rotation_result = client_rotation
+            .validate_license("key")
+            .expect("validate with rotation set");
+        assert_eq!(rotation_result.session_token, "session.validate.token");
+        std::env::remove_var("AUTHFORGE_SDK_TEST_NONCE");
+
         let err_body = r#"{"status":"invalid_key","error":"invalid_key"}"#.to_string();
         let addr_err = run_server(err_body);
         let client_err = AuthForgeClient::new(AuthForgeConfig {
@@ -790,6 +830,74 @@ pub fn verify_payload_signature_ed25519(
     Ok(verifying_key
         .verify(payload_base64.as_bytes(), &signature)
         .is_ok())
+}
+
+/// Multi-key variant: returns `Ok(true)` if the signature matches *any* key
+/// in `public_keys`. Used internally so the SDK keeps verifying during a
+/// server-side rotation; entries that are malformed are skipped rather than
+/// causing the whole call to fail.
+pub fn verify_payload_signature_ed25519_any(
+    payload_base64: &str,
+    signature_base64: &str,
+    public_keys: &[String],
+) -> Result<bool, AuthForgeError> {
+    if public_keys.is_empty() {
+        return Ok(false);
+    }
+    let signature_bytes = decode_base64_any(signature_base64)
+        .map_err(|err| AuthForgeError::Other(format!("signature_base64_decode_failed: {err:?}")))?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|err| AuthForgeError::Other(format!("invalid_signature_bytes: {err}")))?;
+
+    let payload_bytes = payload_base64.as_bytes();
+    for key_b64 in public_keys {
+        let public_key_bytes = match decode_base64_any(key_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => continue
+        };
+        if public_key_bytes.len() != 32 {
+            continue;
+        }
+        let key_array: [u8; 32] = match public_key_bytes.as_slice().try_into() {
+            Ok(arr) => arr,
+            Err(_) => continue
+        };
+        let verifying_key = match VerifyingKey::from_bytes(&key_array) {
+            Ok(vk) => vk,
+            Err(_) => continue
+        };
+        if verifying_key.verify(payload_bytes, &signature).is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Build the canonical trust list from the two public-key fields, in order
+/// of preference. Trims, splits comma-separated `public_key` strings, and
+/// deduplicates while preserving order.
+fn collect_public_keys(rotation_set: &[String], primary: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |raw: &str| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if !out.iter().any(|existing| existing == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    };
+    for key in rotation_set {
+        push(key);
+    }
+    if primary.contains(',') {
+        for segment in primary.split(',') {
+            push(segment);
+        }
+    } else {
+        push(primary);
+    }
+    out
 }
 
 fn parse_signed_response(body: String) -> Result<SignedResponse, AuthForgeError> {
