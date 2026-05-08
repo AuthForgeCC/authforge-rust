@@ -41,6 +41,11 @@ pub struct AuthForgeConfig {
     pub api_base_url: String,
     pub on_failure: Option<Box<FailureCallback>>,
     pub request_timeout: u64,
+    /// HTTP timeout in seconds for `/auth/heartbeat` only. Use a value smaller
+    /// than [`Self::request_timeout`] so a stuck heartbeat does not block
+    /// [`AuthForgeClient::logout`] for as long as activation/validate. `None`
+    /// or `0` resolves to **8** seconds at runtime.
+    pub heartbeat_request_timeout: Option<u64>,
     /// Requested session token lifetime (seconds) forwarded to `/auth/validate`.
     /// `None` means "use the server default" (24h today). Server clamps to
     /// `[3600, 604800]`; out-of-range values are silently clamped.
@@ -60,6 +65,7 @@ impl Default for AuthForgeConfig {
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
             on_failure: None,
             request_timeout: 15,
+            heartbeat_request_timeout: None,
             session_ttl_seconds: None,
             hwid_override: None
         }
@@ -107,6 +113,7 @@ struct RuntimeConfig {
     heartbeat_interval: u64,
     api_base_url: String,
     request_timeout: u64,
+    heartbeat_request_timeout: u64,
     on_failure: Option<Arc<FailureCallback>>,
     session_ttl_seconds: Option<u64>
 }
@@ -273,6 +280,10 @@ impl AuthForgeClient {
             } else {
                 config.request_timeout
             },
+            heartbeat_request_timeout: match config.heartbeat_request_timeout {
+                None | Some(0) => 8,
+                Some(secs) => secs
+            },
             on_failure,
             session_ttl_seconds: config.session_ttl_seconds
         };
@@ -367,7 +378,12 @@ impl AuthForgeClient {
                 blacklist_hwid,
                 blacklist_ip
             };
-            let (response, _) = self.post_json("/auth/selfban", &request, true)?;
+            let (response, _) = self.post_json(
+                "/auth/selfban",
+                &request,
+                true,
+                self.inner.cfg.request_timeout
+            )?;
             if !is_success_status(&response.status) {
                 let code = response.error.unwrap_or_else(|| "unknown_error".to_string());
                 return Err(map_server_error(&code));
@@ -393,7 +409,12 @@ impl AuthForgeClient {
             blacklist_hwid,
             blacklist_ip
         };
-        let (response, _) = self.post_json("/auth/selfban", &request, true)?;
+        let (response, _) = self.post_json(
+            "/auth/selfban",
+            &request,
+            true,
+            self.inner.cfg.request_timeout
+        )?;
         if !is_success_status(&response.status) {
             let code = response.error.unwrap_or_else(|| "unknown_error".to_string());
             return Err(map_server_error(&code));
@@ -412,7 +433,7 @@ impl AuthForgeClient {
             state.clear();
         }
         self.inner.wake_heartbeat_waiters();
-        self.join_heartbeat_worker_if_running();
+        self.detach_heartbeat_worker_if_running();
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -462,8 +483,12 @@ impl AuthForgeClient {
             ttl_seconds: self.inner.cfg.session_ttl_seconds
         };
 
-        let (response, used_nonce) =
-            self.post_json("/auth/validate", &request, invoke_on_network_failure)?;
+        let (response, used_nonce) = self.post_json(
+            "/auth/validate",
+            &request,
+            invoke_on_network_failure,
+            self.inner.cfg.request_timeout
+        )?;
         let payload = self.verify_signed_response(
             response,
             used_nonce.as_deref().unwrap_or(&nonce),
@@ -521,7 +546,15 @@ impl AuthForgeClient {
             hwid: &self.inner.hwid
         };
 
-        let (response, used_nonce) = self.post_json("/auth/heartbeat", &request, true)?;
+        let (response, used_nonce) = self.post_json(
+            "/auth/heartbeat",
+            &request,
+            true,
+            self.inner.cfg.heartbeat_request_timeout
+        )?;
+        if self.inner.stop_signal.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let payload = self.verify_signed_response(
             response,
             used_nonce.as_deref().unwrap_or(&nonce),
@@ -572,9 +605,10 @@ impl AuthForgeClient {
         &self,
         path: &str,
         body: &T,
-        invoke_on_network_failure: bool
+        invoke_on_network_failure: bool,
+        timeout_secs: u64
     ) -> Result<(SignedResponse, Option<String>), AuthForgeError> {
-        let agent = build_agent(self.inner.cfg.request_timeout);
+        let agent = build_agent(timeout_secs);
         let url = format!("{}{}", self.inner.cfg.api_base_url, path);
         let base_value = serde_json::to_value(body)
             .map_err(|err| AuthForgeError::Other(format!("serialize_request_failed: {err}")))?;
@@ -724,11 +758,28 @@ impl AuthForgeClient {
         *lock = Some(handle);
     }
 
+    /// Removes the join handle quickly; caller must [`JoinHandle::join`] or drop
+    /// (detach) without holding [`ClientInner::heartbeat_handle`].
+    fn take_heartbeat_worker(&self) -> Option<JoinHandle<()>> {
+        self.inner
+            .heartbeat_handle
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
     fn join_heartbeat_worker_if_running(&self) {
-        if let Ok(mut handle_lock) = self.inner.heartbeat_handle.lock() {
-            if let Some(handle) = handle_lock.take() {
-                let _ = handle.join();
-            }
+        if let Some(handle) = self.take_heartbeat_worker() {
+            let _ = handle.join();
+        }
+    }
+
+    /// Drops the join handle without blocking on the worker (typically stuck in
+    /// HTTP). The worker still observes [`ClientInner::stop_signal`] and skips
+    /// session writes after a late heartbeat response.
+    fn detach_heartbeat_worker_if_running(&self) {
+        if let Some(handle) = self.take_heartbeat_worker() {
+            drop(handle);
         }
     }
 
