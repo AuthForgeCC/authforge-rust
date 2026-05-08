@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE};
 use base64::Engine;
@@ -145,7 +145,38 @@ struct ClientInner {
     hwid: String,
     state: Arc<Mutex<SessionState>>,
     stop_signal: Arc<AtomicBool>,
+    /// Wakes the heartbeat thread from a timed wait (logout, drop, restart).
+    heartbeat_wake: Mutex<()>,
+    heartbeat_wake_cvar: Condvar,
     heartbeat_handle: Mutex<Option<JoinHandle<()>>>
+}
+
+impl ClientInner {
+    /// Wait until `deadline`, [`Self::stop_signal`] becomes true, or [`Self::wake_heartbeat_waiters`].
+    /// Returns `true` if the worker should exit (stop requested).
+    fn wait_until_heartbeat_deadline(&self, deadline: Instant) -> bool {
+        while !self.stop_signal.load(Ordering::SeqCst) {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let timeout = deadline.duration_since(now);
+            let guard = self
+                .heartbeat_wake
+                .lock()
+                .expect("authforge heartbeat wake mutex poisoned");
+            let (guard, _wait) = self
+                .heartbeat_wake_cvar
+                .wait_timeout(guard, timeout)
+                .expect("authforge heartbeat condvar poisoned");
+            drop(guard);
+        }
+        true
+    }
+
+    fn wake_heartbeat_waiters(&self) {
+        self.heartbeat_wake_cvar.notify_all();
+    }
 }
 
 pub struct AuthForgeClient {
@@ -259,6 +290,8 @@ impl AuthForgeClient {
                 license_variables: None
             })),
             stop_signal: Arc::new(AtomicBool::new(false)),
+            heartbeat_wake: Mutex::new(()),
+            heartbeat_wake_cvar: Condvar::new(),
             heartbeat_handle: Mutex::new(None)
         };
 
@@ -369,13 +402,17 @@ impl AuthForgeClient {
     }
 
     pub fn logout(&self) {
-        self.stop_heartbeat_thread();
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("authforge state mutex poisoned in logout");
-        state.clear();
+        self.inner.stop_signal.store(true, Ordering::SeqCst);
+        {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("authforge state mutex poisoned in logout");
+            state.clear();
+        }
+        self.inner.wake_heartbeat_waiters();
+        self.join_heartbeat_worker_if_running();
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -493,6 +530,9 @@ impl AuthForgeClient {
         let session_data = serde_json::to_value(&payload).unwrap_or(Value::Null);
         let session_token = payload.session_token;
         let expires_in = payload.expires_in;
+        if self.inner.stop_signal.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let mut state = self
             .inner
             .state
@@ -637,18 +677,26 @@ impl AuthForgeClient {
         let client = self.clone();
         let interval = self.inner.cfg.heartbeat_interval;
         let handle = thread::spawn(move || {
-            while !client.inner.stop_signal.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_secs(interval));
-                if client.inner.stop_signal.load(Ordering::SeqCst) {
+            let inner = Arc::clone(&client.inner);
+            let mut deadline = Instant::now() + Duration::from_secs(interval);
+
+            while !inner.stop_signal.load(Ordering::SeqCst) {
+                if inner.wait_until_heartbeat_deadline(deadline) {
+                    break;
+                }
+                if inner.stop_signal.load(Ordering::SeqCst) {
                     break;
                 }
 
-                let heartbeat_result = match client.inner.cfg.heartbeat_mode {
+                let heartbeat_result = match inner.cfg.heartbeat_mode {
                     HeartbeatMode::Server => client.server_heartbeat_with_retry(),
                     HeartbeatMode::Local => client.local_heartbeat_check()
                 };
 
                 if let Err(err) = heartbeat_result {
+                    if inner.stop_signal.load(Ordering::SeqCst) {
+                        break;
+                    }
                     {
                         let mut state = client
                             .inner
@@ -663,6 +711,8 @@ impl AuthForgeClient {
                     }
                     break;
                 }
+
+                deadline = Instant::now() + Duration::from_secs(interval);
             }
         });
 
@@ -674,13 +724,18 @@ impl AuthForgeClient {
         *lock = Some(handle);
     }
 
-    fn stop_heartbeat_thread(&self) {
-        self.inner.stop_signal.store(true, Ordering::SeqCst);
+    fn join_heartbeat_worker_if_running(&self) {
         if let Ok(mut handle_lock) = self.inner.heartbeat_handle.lock() {
             if let Some(handle) = handle_lock.take() {
                 let _ = handle.join();
             }
         }
+    }
+
+    fn stop_heartbeat_thread(&self) {
+        self.inner.stop_signal.store(true, Ordering::SeqCst);
+        self.inner.wake_heartbeat_waiters();
+        self.join_heartbeat_worker_if_running();
     }
 }
 
