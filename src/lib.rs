@@ -76,6 +76,11 @@ impl Default for AuthForgeConfig {
 pub struct LoginResult {
     pub session_token: String,
     pub expires_in: u64,
+    pub session_expires_at: Option<String>,
+    pub license_expires_at: Option<String>,
+    pub max_hwid_slots: Option<u64>,
+    pub hwid_count: Option<u64>,
+    pub license_label: Option<String>,
     pub app_variables: Option<HashMap<String, Value>>,
     pub license_variables: Option<HashMap<String, Value>>,
     pub request_id: String
@@ -205,6 +210,11 @@ struct SignedPayload {
     expires_in: u64,
     nonce: String,
     request_id: Option<String>,
+    session_expires_at: Option<String>,
+    license_expires_at: Option<Value>,
+    max_hwid_slots: Option<u64>,
+    hwid_count: Option<u64>,
+    license_label: Option<String>,
     app_variables: Option<HashMap<String, Value>>,
     license_variables: Option<HashMap<String, Value>>,
     #[serde(flatten)]
@@ -254,6 +264,15 @@ struct SelfBanPostSessionRequest<'a> {
     revoke_license: bool,
     blacklist_hwid: bool,
     blacklist_ip: bool
+}
+
+fn license_expires_from_payload(value: &Option<Value>) -> Option<String> {
+    match value {
+        None => None,
+        Some(Value::Null) => Some(String::new()),
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None
+    }
 }
 
 impl AuthForgeClient {
@@ -499,6 +518,11 @@ impl AuthForgeClient {
         let result = LoginResult {
             session_token: payload.session_token.clone(),
             expires_in: payload.expires_in,
+            session_expires_at: payload.session_expires_at.clone(),
+            license_expires_at: license_expires_from_payload(&payload.license_expires_at),
+            max_hwid_slots: payload.max_hwid_slots,
+            hwid_count: payload.hwid_count,
+            license_label: payload.license_label.clone(),
             app_variables: payload.app_variables.clone(),
             license_variables: payload.license_variables.clone(),
             request_id
