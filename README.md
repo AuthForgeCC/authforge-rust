@@ -74,7 +74,7 @@ fn main() {
 | `app_secret` | `String` | required | Application secret from the dashboard |
 | `public_key` | `String` | required | App Ed25519 public key (base64) from dashboard |
 | `heartbeat_mode` | `HeartbeatMode` | `Local` | `Local` or `Server` heartbeat strategy |
-| `heartbeat_interval` | `u64` | `900` | Heartbeat interval in seconds (any value ≥ 1; default 15 min) |
+| `heartbeat_interval` | `u64` | `900` | Heartbeat interval in seconds (minimum `10`; default 15 min) |
 | `api_base_url` | `String` | `https://auth.authforge.cc` | API base URL |
 | `on_failure` | `Option<Box<dyn Fn(&str)+Send+Sync>>` | `None` | Callback invoked when auth fails |
 | `request_timeout` | `u64` | `15` | Request timeout in seconds |
@@ -99,7 +99,7 @@ let client = AuthForgeClient::new(AuthForgeConfig {
 - **1 `login()` or `validate_license()` call = 1 credit** (one `/auth/validate` debit each).
 - **10 heartbeats on the same license = 1 credit** (billed every 10th successful heartbeat).
 
-A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. A server app running 24/7 at a 1-minute interval burns ~145 credits/day — pick the interval based on how fast you need revocations to propagate (they always land on the **next** heartbeat).
+A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. `/auth/heartbeat` is limited to 6 requests/minute per license key, so keep intervals at 10 seconds or higher and choose cadence based on revocation speed needs (they always land on the **next** heartbeat).
 
 ## Methods
 
@@ -133,7 +133,8 @@ Errors are returned as `AuthForgeError`, including:
 - `AppDisabled`
 - `SessionExpired`
 - `RevokeRequiresSession`
-- `BadRequest`
+- `BadRequest` (covers both `bad_request` and `malformed_request`)
+- `SystemError`
 - `SignatureMismatch`
 - `NetworkError(String)`
 - `Other(String)`

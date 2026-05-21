@@ -11,7 +11,7 @@ AuthForge is a license key validation service. Your app sends a license key + ha
 
 - **1 `login()` or `validate_license()` = 1 credit** (one `/auth/validate` debit each).
 - **10 heartbeats = 1 credit** (billed on every 10th successful heartbeat per license).
-- Any `heartbeat_interval` is safe — from `1` (server apps) to `900` (15 min, desktop apps). Revocations always take effect on the **next** heartbeat regardless of interval.
+- Keep `heartbeat_interval` at `>= 10` seconds (`900` / 15 min is the common desktop default). `/auth/heartbeat` is limited to 6 requests/minute per license key, and revocations still take effect on the **next** heartbeat.
 
 ## Installation
 
@@ -65,7 +65,7 @@ fn run_app() {
 | `app_id` | `String` | yes | empty | Application ID |
 | `app_secret` | `String` | yes | empty | Application secret |
 | `heartbeat_mode` | `HeartbeatMode` | yes | `Local` | `HeartbeatMode::Server` or `HeartbeatMode::Local` |
-| `heartbeat_interval` | `u64` | no | `900` | Seconds between heartbeats (any value ≥ 1; `0` coerced to `900`) |
+| `heartbeat_interval` | `u64` | no | `900` | Seconds between heartbeats (minimum `10`; `0` coerced to `900`) |
 | `api_base_url` | `String` | no | `https://auth.authforge.cc` | API base URL |
 | `on_failure` | `Option<Box<dyn Fn(&str) + Send + Sync>>` | no | `None` | Invoked on heartbeat failure (and `login` network failure after retry); **not** invoked for `validate_license` network errors |
 | `request_timeout` | `u64` | no | `15` | HTTP timeout seconds (`0` → `15`) |
@@ -93,7 +93,7 @@ invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, blocked, 
 (Maps to `AuthForgeError` variants and `AuthForgeError::Other(String)` for unknown strings.)
 
 Notes:
-- `rate_limited` and `replay_detected` can only be returned from `/auth/validate`. Heartbeats are not IP rate-limited and do not enforce nonce replay.
+- `replay_detected` is validate-only. `rate_limited` can be returned by `/auth/validate` and `/auth/heartbeat` (heartbeat is license-limited at 6/min and has no app-layer IP limit).
 
 ## Common patterns
 

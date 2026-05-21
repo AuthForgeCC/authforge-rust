@@ -286,6 +286,8 @@ impl AuthForgeClient {
             heartbeat_mode: config.heartbeat_mode,
             heartbeat_interval: if config.heartbeat_interval == 0 {
                 900
+            } else if config.heartbeat_interval < 10 {
+                10
             } else {
                 config.heartbeat_interval
             },
@@ -1051,6 +1053,7 @@ fn map_server_error(error: &str) -> AuthForgeError {
         "replay_detected" => AuthForgeError::ReplayDetected,
         "revoke_requires_session" => AuthForgeError::RevokeRequiresSession,
         "bad_request" => AuthForgeError::BadRequest,
+        "malformed_request" => AuthForgeError::BadRequest,
         "system_error" => AuthForgeError::SystemError,
         _ => AuthForgeError::Other(error.to_string())
     }
