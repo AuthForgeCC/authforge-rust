@@ -1,8 +1,8 @@
 ﻿[package]
 name = "authforge"
-version = "1.0.8"
+version = "1.1.0"
 edition = "2021"
-description = "AuthForge SDK â€” license validation, HWID binding, and heartbeat verification"
+description = "AuthForge SDK: license validation with signed sessions, HWID binding, a grace period by default, and optional online check-ins"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/AuthForgeCC/authforge-rust"

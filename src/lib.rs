@@ -19,6 +19,7 @@ static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub type FailureCallback = dyn Fn(&str) + Send + Sync;
 
 #[derive(Debug, Clone)]
+#[deprecated(note = "use online_heartbeat: true for online check-ins; the default is the grace period behavior")]
 pub enum HeartbeatMode {
     Local,
     Server
@@ -36,7 +37,19 @@ pub struct AuthForgeConfig {
     /// server-side key during a cutover. A signature that matches *any*
     /// entry verifies successfully.
     pub public_keys: Vec<String>,
+    /// Deprecated policy selector kept for compatibility. Prefer
+    /// [`Self::online_heartbeat`]. `HeartbeatMode::Server` still maps to
+    /// online check-ins at construction; `HeartbeatMode::Local` matches the
+    /// default grace period behavior.
+    #[deprecated(note = "use online_heartbeat: true for online check-ins; the default is the grace period behavior")]
+    #[allow(deprecated)]
     pub heartbeat_mode: HeartbeatMode,
+    /// Opt into online check-ins: periodic `POST /auth/heartbeat` calls for
+    /// fast revocation and concurrent-use detection. When `false` (the
+    /// default), the client runs through the grace period instead: it keeps
+    /// running on the signed session without contacting AuthForge and fails
+    /// once the session TTL expires.
+    pub online_heartbeat: bool,
     pub heartbeat_interval: u64,
     pub api_base_url: String,
     pub on_failure: Option<Box<FailureCallback>>,
@@ -46,14 +59,17 @@ pub struct AuthForgeConfig {
     /// [`AuthForgeClient::logout`] for as long as activation/validate. `None`
     /// or `0` resolves to **8** seconds at runtime.
     pub heartbeat_request_timeout: Option<u64>,
-    /// Requested session token lifetime (seconds) forwarded to `/auth/validate`.
-    /// `None` means "use the server default" (24h today). Server clamps to
-    /// `[3600, 604800]`; out-of-range values are silently clamped.
+    /// Requested grace period duration (seconds), forwarded to `/auth/validate`
+    /// as the session token lifetime. This controls how long the app keeps
+    /// running on the signed session without contacting AuthForge. `None`
+    /// means "use the server default" (24h today). Server clamps to
+    /// `[3600, 604800]` (1h to 7d); out-of-range values are silently clamped.
     pub session_ttl_seconds: Option<u64>,
     pub hwid_override: Option<String>
 }
 
 impl Default for AuthForgeConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             app_id: String::new(),
@@ -61,6 +77,7 @@ impl Default for AuthForgeConfig {
             public_key: String::new(),
             public_keys: Vec::new(),
             heartbeat_mode: HeartbeatMode::Local,
+            online_heartbeat: false,
             heartbeat_interval: 900,
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
             on_failure: None,
@@ -114,7 +131,9 @@ struct RuntimeConfig {
     app_secret: String,
     /// Canonical trust list — never empty after construction.
     public_keys: Vec<String>,
-    heartbeat_mode: HeartbeatMode,
+    /// Effective policy: `true` runs online check-ins (`/auth/heartbeat`),
+    /// `false` runs the grace period check (no network).
+    online_heartbeat: bool,
     heartbeat_interval: u64,
     api_base_url: String,
     request_timeout: u64,
@@ -279,11 +298,16 @@ impl AuthForgeClient {
     pub fn new(config: AuthForgeConfig) -> Self {
         let on_failure = config.on_failure.map(Arc::<FailureCallback>::from);
         let public_keys = collect_public_keys(&config.public_keys, &config.public_key);
+        // Effective policy: the deprecated HeartbeatMode::Server shim still
+        // opts into online check-ins.
+        #[allow(deprecated)]
+        let online_heartbeat =
+            config.online_heartbeat || matches!(config.heartbeat_mode, HeartbeatMode::Server);
         let runtime_cfg = RuntimeConfig {
             app_id: config.app_id,
             app_secret: config.app_secret,
             public_keys,
-            heartbeat_mode: config.heartbeat_mode,
+            online_heartbeat,
             heartbeat_interval: if config.heartbeat_interval == 0 {
                 900
             } else if config.heartbeat_interval < 10 {
@@ -604,7 +628,10 @@ impl AuthForgeClient {
         Ok(())
     }
 
-    fn local_heartbeat_check(&self) -> Result<(), AuthForgeError> {
+    /// Grace period check: no network. Confirms the session is still
+    /// authenticated and the stored expiry has not passed, failing with
+    /// `Expired` once the grace period (the session TTL) runs out.
+    fn grace_period_check(&self) -> Result<(), AuthForgeError> {
         let (authenticated, expires_in) = {
             let state = self
                 .inner
@@ -748,9 +775,12 @@ impl AuthForgeClient {
                     break;
                 }
 
-                let heartbeat_result = match inner.cfg.heartbeat_mode {
-                    HeartbeatMode::Server => client.server_heartbeat_with_retry(),
-                    HeartbeatMode::Local => client.local_heartbeat_check()
+                // Online check-ins call /auth/heartbeat; otherwise run the
+                // grace period check against the stored session expiry.
+                let heartbeat_result = if inner.cfg.online_heartbeat {
+                    client.server_heartbeat_with_retry()
+                } else {
+                    client.grace_period_check()
                 };
 
                 if let Err(err) = heartbeat_result {
@@ -883,7 +913,6 @@ mod validate_license_tests {
             app_id: "app".into(),
             app_secret: "secret".into(),
             public_key: public_key.into(),
-            heartbeat_mode: HeartbeatMode::Local,
             api_base_url: format!("http://{}", addr_ok),
             ..Default::default()
         });
@@ -911,7 +940,6 @@ mod validate_license_tests {
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
                 public_key.into(),
             ],
-            heartbeat_mode: HeartbeatMode::Local,
             api_base_url: format!("http://{}", addr_rotation),
             ..Default::default()
         });
@@ -927,13 +955,39 @@ mod validate_license_tests {
             app_id: "app".into(),
             app_secret: "secret".into(),
             public_key: "0wRcYWn44wk9tHOisXgso1wbtUqpFdy0IeMk4HXDiNc=".into(),
-            heartbeat_mode: HeartbeatMode::Local,
             api_base_url: format!("http://{}", addr_err),
             ..Default::default()
         });
         let err = client_err.validate_license("bad").unwrap_err();
         assert!(matches!(err, AuthForgeError::InvalidKey), "{err:?}");
         assert!(!client_err.is_authenticated());
+    }
+
+    #[test]
+    fn default_config_uses_grace_period() {
+        let config = AuthForgeConfig::default();
+        assert!(!config.online_heartbeat);
+        let client = AuthForgeClient::new(config);
+        assert!(!client.inner.cfg.online_heartbeat);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_server_mode_maps_to_online_check_ins() {
+        let client = AuthForgeClient::new(AuthForgeConfig {
+            heartbeat_mode: HeartbeatMode::Server,
+            ..Default::default()
+        });
+        assert!(client.inner.cfg.online_heartbeat);
+    }
+
+    #[test]
+    fn online_heartbeat_flag_enables_online_check_ins() {
+        let client = AuthForgeClient::new(AuthForgeConfig {
+            online_heartbeat: true,
+            ..Default::default()
+        });
+        assert!(client.inner.cfg.online_heartbeat);
     }
 }
 
