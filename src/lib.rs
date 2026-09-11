@@ -12,6 +12,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use ureq::{Agent, Error as UreqError};
 
+mod offline;
+
+pub use offline::{
+    parse_iso8601_ms, parse_license_file, verify_license_file, OfflineHwidPolicy, OfflineLicense,
+    OfflineLicenseError, ParsedLicenseFile, VerifyLicenseFileOptions, OFFLINE_LICENSE_FILE_VERSION
+};
+
 const DEFAULT_API_BASE_URL: &str = "https://auth.authforge.cc";
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -142,26 +149,41 @@ struct RuntimeConfig {
     session_ttl_seconds: Option<u64>
 }
 
+/// How the client authenticated: a server session from [`AuthForgeClient::login`]
+/// or a locally verified `.authforge` file from [`AuthForgeClient::login_from_file`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    Online,
+    Offline
+}
+
 #[derive(Debug, Clone)]
 struct SessionState {
     authenticated: bool,
+    /// Drives `is_authenticated`, `self_ban` and the heartbeat guard so an
+    /// offline file session can never be mistaken for a server session.
+    session_kind: Option<SessionKind>,
     license_key: Option<String>,
     session_token: Option<String>,
     expires_in: Option<u64>,
     session_data: Option<Value>,
     app_variables: Option<HashMap<String, Value>>,
-    license_variables: Option<HashMap<String, Value>>
+    license_variables: Option<HashMap<String, Value>>,
+    /// Set when the client authenticated via `login_from_file`.
+    offline_license: Option<OfflineLicense>
 }
 
 impl SessionState {
     fn clear(&mut self) {
         self.authenticated = false;
+        self.session_kind = None;
         self.license_key = None;
         self.session_token = None;
         self.expires_in = None;
         self.session_data = None;
         self.app_variables = None;
         self.license_variables = None;
+        self.offline_license = None;
     }
 }
 
@@ -338,12 +360,14 @@ impl AuthForgeClient {
             hwid: resolve_hwid(config.hwid_override),
             state: Arc::new(Mutex::new(SessionState {
                 authenticated: false,
+                session_kind: None,
                 license_key: None,
                 session_token: None,
                 expires_in: None,
                 session_data: None,
                 app_variables: None,
-                license_variables: None
+                license_variables: None,
+                offline_license: None
             })),
             stop_signal: Arc::new(AtomicBool::new(false)),
             heartbeat_wake: Mutex::new(()),
@@ -400,20 +424,39 @@ impl AuthForgeClient {
         blacklist_hwid: bool,
         blacklist_ip: bool
     ) -> Result<(), AuthForgeError> {
-        let (current_session, current_license) = {
+        let (current_session, current_license, current_kind) = {
             let state = self
                 .inner
                 .state
                 .lock()
                 .map_err(|_| AuthForgeError::Other("state_lock_failed".to_string()))?;
-            (state.session_token.clone(), state.license_key.clone())
+            (
+                state.session_token.clone(),
+                state.license_key.clone(),
+                state.session_kind
+            )
         };
 
-        let resolved_session = session_token
+        let explicit_session = session_token
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .or(current_session);
+            .map(ToOwned::to_owned);
+        let explicit_license = license_key
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        // An offline session has no server session and must never phone home
+        // on its own. Callers who pass an explicit license key / session token
+        // are asking about a *different* credential and get the normal paths.
+        if current_kind == Some(SessionKind::Offline)
+            && explicit_session.is_none()
+            && explicit_license.is_none()
+        {
+            return Err(AuthForgeError::Other("offline_session".to_string()));
+        }
+
+        let resolved_session = explicit_session.or(current_session);
         if let Some(session) = resolved_session {
             let request = SelfBanPostSessionRequest {
                 app_id: &self.inner.cfg.app_id,
@@ -436,10 +479,7 @@ impl AuthForgeClient {
             return Ok(());
         }
 
-        let resolved_license = license_key
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
+        let resolved_license = explicit_license
             .or(current_license)
             .ok_or_else(|| AuthForgeError::Other("missing_license_key".to_string()))?;
         let nonce = generate_nonce();
@@ -481,12 +521,34 @@ impl AuthForgeClient {
         self.detach_heartbeat_worker_if_running();
     }
 
+    /// `true` for an online session ([`Self::login`]) or an offline one
+    /// ([`Self::login_from_file`]).
     pub fn is_authenticated(&self) -> bool {
         self.inner
             .state
             .lock()
-            .map(|state| state.authenticated)
+            .map(|state| {
+                state.authenticated
+                    && match state.session_kind {
+                        Some(SessionKind::Online) => state.session_token.is_some(),
+                        Some(SessionKind::Offline) => true,
+                        None => false
+                    }
+            })
             .unwrap_or(false)
+    }
+
+    /// How the client authenticated: [`SessionKind::Online`] after
+    /// [`Self::login`], [`SessionKind::Offline`] after [`Self::login_from_file`],
+    /// `None` when logged out. [`Self::self_ban`] without an explicit license
+    /// key / session token fails with `Other("offline_session")` on an offline
+    /// session and never contacts the server.
+    pub fn get_session_kind(&self) -> Option<SessionKind> {
+        self.inner
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.session_kind)
     }
 
     pub fn get_session_data(&self) -> Option<Value> {
@@ -511,6 +573,102 @@ impl AuthForgeClient {
             .lock()
             .ok()
             .and_then(|state| state.license_variables.clone())
+    }
+
+    /// The HWID this client sends to AuthForge (or `hwid_override`).
+    ///
+    /// Customers on air-gapped machines report this value to the operator so
+    /// an offline `.authforge` file can be bound to it.
+    pub fn hwid(&self) -> &str {
+        &self.inner.hwid
+    }
+
+    /// Authorize from a cloud-minted offline license file (`.authforge`) with
+    /// NO network access. Accepts a filesystem path or the armored text.
+    ///
+    /// On success the client is authenticated ([`Self::is_authenticated`],
+    /// [`Self::get_session_data`], [`Self::get_app_variables`],
+    /// [`Self::get_license_variables`] work) and [`Self::get_offline_license`]
+    /// describes the file. No grace-period thread and no online check-ins are
+    /// started - the file's own `expires_at` is the only clock. Online
+    /// [`Self::login`] is untouched.
+    ///
+    /// Failures are returned as [`OfflineLicenseError`] and echoed to
+    /// `on_failure` as `offline_login_failed: <code>`.
+    pub fn login_from_file(&self, path_or_text: &str) -> Result<OfflineLicense, OfflineLicenseError> {
+        let text = read_license_file_input(path_or_text).inspect_err(|err| {
+            self.notify_failure(&format!("offline_login_failed: {err}"));
+        })?;
+        let lic = self.verify_license_file_text(&text, None).inspect_err(|err| {
+            self.notify_failure(&format!("offline_login_failed: {}", err.code()));
+        })?;
+        self.apply_offline_license(&lic);
+        Ok(lic)
+    }
+
+    /// Verify a `.authforge` file (filesystem path or armored text) with this
+    /// client's app id, public key(s) and HWID, without touching session state.
+    pub fn verify_license_file(&self, path_or_text: &str) -> Result<OfflineLicense, OfflineLicenseError> {
+        let text = read_license_file_input(path_or_text)?;
+        self.verify_license_file_text(&text, None)
+    }
+
+    /// The offline file the client authenticated with, or `None`.
+    pub fn get_offline_license(&self) -> Option<OfflineLicense> {
+        self.inner
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.offline_license.clone())
+    }
+
+    fn verify_license_file_text(
+        &self,
+        text: &str,
+        now_epoch_ms: Option<i64>
+    ) -> Result<OfflineLicense, OfflineLicenseError> {
+        verify_license_file(
+            text,
+            &VerifyLicenseFileOptions {
+                app_id: self.inner.cfg.app_id.clone(),
+                public_keys: self.inner.cfg.public_keys.clone(),
+                hwid: Some(self.inner.hwid.clone()),
+                now_epoch_ms
+            }
+        )
+    }
+
+    fn apply_offline_license(&self, lic: &OfflineLicense) {
+        // Stop any online session first so the two modes never overlap.
+        self.logout();
+        let expires_in = lic
+            .expires_at
+            .as_deref()
+            .and_then(parse_iso8601_ms)
+            .map(|ms| (ms / 1000).max(0) as u64);
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("authforge state mutex poisoned in login_from_file");
+        state.authenticated = true;
+        state.license_key = Some(lic.license_key.clone());
+        // Offline files carry no server session token. The explicit session
+        // kind (not a token sentinel) is what makes is_authenticated true and
+        // keeps self_ban/heartbeats from ever contacting the server.
+        state.session_token = None;
+        state.session_kind = Some(SessionKind::Offline);
+        state.expires_in = expires_in;
+        state.session_data = Some(lic.payload.clone());
+        state.app_variables = lic.app_variables.clone();
+        state.license_variables = lic.license_variables.clone();
+        state.offline_license = Some(lic.clone());
+    }
+
+    fn notify_failure(&self, message: &str) {
+        if let Some(callback) = &self.inner.cfg.on_failure {
+            callback(message);
+        }
     }
 
     fn validate_payload_only(
@@ -565,6 +723,7 @@ impl AuthForgeClient {
             .lock()
             .map_err(|_| AuthForgeError::Other("state_lock_failed".to_string()))?;
         state.authenticated = true;
+        state.session_kind = Some(SessionKind::Online);
         state.license_key = Some(license_key.to_string());
         state.session_token = Some(payload.session_token.clone());
         state.expires_in = Some(payload.expires_in);
@@ -758,6 +917,17 @@ impl AuthForgeClient {
     }
 
     fn start_heartbeat_thread(&self) {
+        // Offline sessions have no grace period and no online check-ins: the
+        // file's own expires_at is the only clock. Never start a thread for them.
+        let offline = self
+            .inner
+            .state
+            .lock()
+            .map(|state| state.session_kind == Some(SessionKind::Offline))
+            .unwrap_or(false);
+        if offline {
+            return;
+        }
         self.stop_heartbeat_thread();
         self.inner.stop_signal.store(false, Ordering::SeqCst);
 
@@ -1130,6 +1300,18 @@ fn decode_base64_any(value: &str) -> Result<Vec<u8>, AuthForgeError> {
         .decode(value)
         .or_else(|_| URL_SAFE.decode(value))
         .map_err(|err| AuthForgeError::Other(format!("payload_base64_decode_failed: {err}")))
+}
+
+fn read_license_file_input(path_or_text: &str) -> Result<String, OfflineLicenseError> {
+    if path_or_text.trim().is_empty() {
+        return Err(OfflineLicenseError::ReadError(
+            "license file must be a path or the armored text".to_string()
+        ));
+    }
+    if offline::contains_armor(path_or_text) {
+        return Ok(path_or_text.to_string());
+    }
+    std::fs::read_to_string(path_or_text).map_err(|err| OfflineLicenseError::ReadError(err.to_string()))
 }
 
 fn generate_hwid() -> String {

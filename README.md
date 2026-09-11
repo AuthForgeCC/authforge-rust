@@ -20,6 +20,7 @@ Everything in this list ships in `src/lib.rs` today:
 - **`hwid_override`**: bind to any identity instead of the machine (for example `tg:<id>`, `discord:<id>`).
 - **Seat enforcement**: the server binds each HWID into a license's free slots up to `max_hwid_slots`; `hwid_count` / `max_hwid_slots` are surfaced on `LoginResult`. A shared (unlimited-seat) key skips per-device binding.
 - **Grace period by default, opt-in online check-ins** (see [Grace period and online check-ins](#grace-period-and-online-check-ins)).
+- **Offline license files (`.authforge`)**: `login_from_file` / `verify_license_file` verify a cloud-minted, Ed25519-signed file with zero network access for air-gapped machines.
 - **Self-ban** (`self_ban(...)`) for anti-tamper response, both pre-session and post-session.
 - **Grace period duration control** (`session_ttl_seconds`) with server-side clamping to `[3600, 604800]` (1h to 7d).
 - **App variables / license variables** for feature flags and tiered licensing.
@@ -144,7 +145,48 @@ A comma-separated `public_key` (`"NEW,PREVIOUS"`) works too, for env-var conveni
 - **Grace period** (the default, no config needed): after a successful online activation, the app keeps running on the Ed25519-signed session without contacting AuthForge. On each `heartbeat_interval` the SDK confirms the session is still authenticated and that the stored expiry has not passed, failing with `Expired` once it has. (The signature was already verified at activation; the check is expiry-only and does not re-verify the cached signature.) The grace period equals the session TTL: server default 24h, clamped to 1h to 7d via `session_ttl_seconds`.
 - **Online check-ins** (`online_heartbeat: true`): the SDK sends `/auth/heartbeat` on each interval, verifies the signature + nonce, and refreshes the stored session. Use this when you need fast revocation or concurrent-use detection; revocations take effect on the **next** check-in rather than at the end of the grace period.
 
-Either way, the grace period is session continuation after one successful online activation, not persistent offline licensing. The app must reach AuthForge again once the signed session expires.
+Either way, the grace period is session continuation after one successful online activation, not persistent offline licensing. The app must reach AuthForge again once the signed session expires. For machines that can never reach AuthForge, use an [offline license file](#offline-license-files-authforge) instead.
+
+## Offline license files (`.authforge`)
+
+For machines that never connect to the internet, the operator mints a **signed offline license file** in the AuthForge dashboard (License page -> *Mint .authforge file*) or via `POST /v1/licenses/{licenseKey}/offline-files`. The file is a standalone Ed25519-signed document; the SDK verifies it with **only** your app public key and the machine HWID. It never contacts AuthForge and never starts the background thread.
+
+| | Grace period (default) | Offline license file |
+| --- | --- | --- |
+| Needs network | Once, at `login()` | Never on the end machine |
+| What is verified | Signed *session* from `/auth/validate` | Signed *document* minted in the cloud |
+| Lifetime | Session TTL: 1h to 7d | Operator-chosen expiry or lifetime (perpetual licenses only) |
+| Revocation | Picked up at the next online validate / check-in | **Not** reachable: the file stays valid until its own expiry |
+| Cost | 1 credit per `login()` | 1 credit per mint; verifying is free |
+
+```rust
+use authforge::{AuthForgeClient, AuthForgeConfig, OfflineLicenseError};
+
+let client = AuthForgeClient::new(AuthForgeConfig {
+    app_id: "YOUR_APP_ID".into(),
+    app_secret: "YOUR_APP_SECRET".into(), // unused for offline files but still required
+    public_key: "YOUR_PUBLIC_KEY".into(),
+    on_failure: Some(Box::new(|msg| eprintln!("authforge: {msg}"))),
+    ..Default::default()
+});
+
+// 1. The customer sends you this value so you can bind the file to their machine:
+println!("HWID: {}", client.hwid());
+
+// 2. Later, authorize from the minted file (path or armored text). No network.
+match client.login_from_file("license.authforge") {
+    Ok(lic) => println!("Offline license OK until {:?}", lic.expires_at), // None = lifetime
+    Err(OfflineLicenseError::Expired) => eprintln!("offline license expired - ask the operator for a new file"),
+    Err(OfflineLicenseError::HwidMismatch) => eprintln!("this file is bound to a different machine"),
+    Err(err) => eprintln!("offline license rejected: {err}"),
+}
+```
+
+Collect the HWID from the same SDK build that will load the file: fingerprints are not portable across SDKs or languages. After `login_from_file`, `get_session_kind()` returns `Some(SessionKind::Offline)` (`Some(SessionKind::Online)` after `login`, `None` when logged out).
+
+`authforge::verify_license_file(text, &opts)` (crate function) and `client.verify_license_file(path_or_text)` perform the same checks without touching client state. Errors are the `OfflineLicenseError` enum, in check order: `BadArmor`, `BadSignature`, `UnsupportedVersion`, `MalformedPayload`, `WrongApp`, `Expired`, `HwidMismatch` (plus `ReadError` when a path cannot be read); `.code()` gives the cross-SDK string. `login_from_file` also reports `offline_login_failed: <code>` through `on_failure`. The `AuthForgeError` enum used by the online APIs is unchanged.
+
+File format (version 1): PEM-style armor with informational headers, a base64 JSON payload (`v`, `appId`, `licenseKey`, `jti`, `kid`, `issuedAt`, `expiresAt`, `hwid` policy, optional label/variable snapshots) and a detached Ed25519 signature over the UTF-8 bytes of the base64 payload string - the same contract as `/auth/validate`. See `offline_license_vectors.json` for conformance vectors.
 
 ## Migrating from HeartbeatMode
 
@@ -182,6 +224,11 @@ With online check-ins, a desktop app running 6h/day at a 15-minute interval burn
 - `login(&self, license_key: &str) -> Result<LoginResult, AuthForgeError>`
 - `validate_license(&self, license_key: &str) -> Result<LoginResult, AuthForgeError>`: same `/auth/validate` + verification as `login`, without storing session or starting the background thread; **`on_failure` is not called** for network errors on this path
 - `self_ban(&self, license_key: Option<&str>, session_token: Option<&str>, revoke_license: bool, blacklist_hwid: bool, blacklist_ip: bool) -> Result<(), AuthForgeError>`
+- `login_from_file(&self, path_or_text: &str) -> Result<OfflineLicense, OfflineLicenseError>`: authorizes from an offline `.authforge` file with no network; never starts the background thread; failures are echoed to `on_failure` as `offline_login_failed: <code>`
+- `verify_license_file(&self, path_or_text: &str) -> Result<OfflineLicense, OfflineLicenseError>`: same checks without changing state
+- `get_offline_license(&self) -> Option<OfflineLicense>`: the offline file in use (`jti`, `expires_at`, `hwid_policy`, …)
+- `get_session_kind(&self) -> Option<SessionKind>`: `Some(SessionKind::Online)`, `Some(SessionKind::Offline)`, or `None` when logged out
+- `hwid(&self) -> &str`: the HWID this client sends (or `hwid_override`); customers share it to receive a bound file
 - `logout(&self)`
 - `is_authenticated(&self) -> bool`
 - `get_session_data(&self) -> Option<serde_json::Value>`
@@ -235,6 +282,7 @@ client.self_ban(None, None, false, true, true)?;
 - Uses post-session mode when a session token is available (`session_token` arg or current SDK session).
 - Falls back to pre-session mode with `license_key` + nonce + app secret.
 - In pre-session mode, revoke is always disabled client-side to avoid unsafe key revocations.
+- Not available after `login_from_file`: offline sessions have no server session, so `self_ban` with no explicit `license_key` / `session_token` returns `Err(AuthForgeError::Other("offline_session"))` without contacting the server.
 
 ## License
 
