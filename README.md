@@ -99,7 +99,7 @@ To enable online check-ins instead, add `online_heartbeat: true` (and optionally
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `app_id` | `String` | required | Application ID from the dashboard |
-| `app_secret` | `String` | required | Application secret from the dashboard |
+| `app_secret` | `String` | empty for `login_from_file` only | Application secret from the dashboard. Required for `login` / `validate_license`. Leave empty in air-gapped builds. |
 | `public_key` | `String` | required* | App Ed25519 public key (base64) from dashboard. Accepts a comma-separated trust list. *Required unless `public_keys` is set. |
 | `public_keys` | `Vec<String>` | optional | Rotation set of trusted keys. Merged ahead of `public_key`; the SDK trusts a signature matching **any** entry (see [Key rotation](#key-rotation)). |
 | `online_heartbeat` | `bool` | `false` | `true` enables online check-ins (periodic `/auth/heartbeat`). `false` (default) runs through the grace period with no network calls after activation. |
@@ -149,7 +149,7 @@ Either way, the grace period is session continuation after one successful online
 
 ## Offline license files (`.authforge`)
 
-For machines that never connect to the internet, the operator mints a **signed offline license file** in the AuthForge dashboard (License page -> *Mint .authforge file*) or via `POST /v1/licenses/{licenseKey}/offline-files`. The file is a standalone Ed25519-signed document; the SDK verifies it with **only** your app public key and the machine HWID. It never contacts AuthForge and never starts the background thread.
+For machines that never connect to the internet, the operator mints a **signed offline license file** in the AuthForge dashboard (License page -> *Mint .authforge file*) or via `POST /v1/licenses/{licenseKey}/offline-files`. The file is a standalone Ed25519-signed document; the SDK verifies it with **only** your app public key and the machine HWID. It never contacts AuthForge and never starts the background thread. Leave `app_secret` empty so the air-gapped binary does not contain the App Secret.
 
 | | Grace period (default) | Offline license file |
 | --- | --- | --- |
@@ -164,7 +164,6 @@ use authforge::{AuthForgeClient, AuthForgeConfig, OfflineLicenseError};
 
 let client = AuthForgeClient::new(AuthForgeConfig {
     app_id: "YOUR_APP_ID".into(),
-    app_secret: "YOUR_APP_SECRET".into(), // unused for offline files but still required
     public_key: "YOUR_PUBLIC_KEY".into(),
     on_failure: Some(Box::new(|msg| eprintln!("authforge: {msg}"))),
     ..Default::default()

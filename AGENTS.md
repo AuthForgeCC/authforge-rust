@@ -7,7 +7,7 @@
 
 AuthForge is a license key validation service. Your app activates online: it sends a license key + hardware ID to `POST /auth/validate`, and the server checks revocation, expiry, HWID binding, and credits, then returns an Ed25519-signed session with a TTL. By default the app then runs through the **grace period**: it keeps running on the signed session with no further network calls until the session TTL expires (server default 24h, clamped 1h to 7d). Optionally, enable **online check-ins** (`online_heartbeat: true`) to send periodic `POST /auth/heartbeat` requests for fast revocation and concurrent-use detection. When the grace period expires or a check-in fails, `on_failure` is invoked and you handle it (typically exit the app).
 
-There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `login_from_file` verifies it locally with the app public key and the machine HWID, with zero network calls. Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `login` + grace period.
+There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `login_from_file` verifies it locally with the app public key and the machine HWID, with zero network calls. Do not ship the App Secret in those builds (leave `app_secret` empty). Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `login` + grace period.
 
 ## Billing model (so you can pick sensible intervals)
 
@@ -70,7 +70,7 @@ To enable online check-ins, add `online_heartbeat: true` (and optionally set `he
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `app_id` | `String` | yes | empty | Application ID |
-| `app_secret` | `String` | yes | empty | Application secret |
+| `app_secret` | `String` | for online APIs | empty | Application secret. Required for `login` / `validate_license` / `self_ban`. Leave empty for `login_from_file` only; do not ship it in air-gapped binaries. |
 | `public_key` | `String` | yes* | empty | Base64 Ed25519 public key from the dashboard. Accepts a comma-separated trust list. *Required unless `public_keys` is set; with neither, `login` returns `InvalidApp` |
 | `public_keys` | `Vec<String>` | no | empty | Rotation set; merged ahead of `public_key`. The SDK trusts a signature matching **any** entry |
 | `online_heartbeat` | `bool` | no | `false` | `true` enables online check-ins (periodic `/auth/heartbeat`). `false` (default) runs through the grace period with no network after activation |
@@ -162,6 +162,7 @@ Handle `AuthForgeError` from `login` or `validate_license`; background check fai
 ## Do NOT
 
 - Do not hardcode the app secret as a plain string literal in source; use environment variables or encrypted config
+- Do not embed the App Secret in air-gapped / `login_from_file` builds; leave `app_secret` empty (`Default` already does); verification only needs app id + public key
 - Do not omit `on_failure` if you need controlled shutdown; checks run in a background thread and failures are reported through this callback
 - Do not call `login` on every app action; call once at startup, the grace period (or online check-ins) handles the rest
 - Do not enable `online_heartbeat` unless you need fast revocation or concurrent-use detection; the default grace period is cheaper and works without a persistent connection

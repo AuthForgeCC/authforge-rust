@@ -34,6 +34,9 @@ pub enum HeartbeatMode {
 
 pub struct AuthForgeConfig {
     pub app_id: String,
+    /// Application secret. Required for online APIs (`login`, `validate_license`,
+    /// `self_ban`). Leave empty for offline-only clients (`login_from_file`);
+    /// air-gapped builds should not ship the secret.
     pub app_secret: String,
     /// Trusted Ed25519 public key in base64. Use `public_keys` instead for
     /// rotation set support; `public_key` remains for the single-key
@@ -482,6 +485,9 @@ impl AuthForgeClient {
         let resolved_license = explicit_license
             .or(current_license)
             .ok_or_else(|| AuthForgeError::Other("missing_license_key".to_string()))?;
+        if self.inner.cfg.app_secret.trim().is_empty() {
+            return Err(AuthForgeError::InvalidApp);
+        }
         let nonce = generate_nonce();
         let request = SelfBanPreSessionRequest {
             app_id: &self.inner.cfg.app_id,

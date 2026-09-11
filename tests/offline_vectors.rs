@@ -125,7 +125,7 @@ fn make_client(good: &OfflineCase, mutate: impl FnOnce(&mut AuthForgeConfig)) ->
     let sink = Arc::clone(&failures);
     let mut cfg = AuthForgeConfig {
         app_id: good.app_id.clone(),
-        app_secret: "unused-offline".to_string(),
+        app_secret: String::new(),
         public_key: good.public_key.clone(),
         hwid_override: Some(good.hwid.clone()),
         // Any network call would hit a closed port and fail loudly.
@@ -166,6 +166,9 @@ fn login_from_file_is_offline_and_starts_no_heartbeat() {
     assert!(!client.is_authenticated());
     assert_eq!(client.get_session_kind(), None);
     assert!(client.get_offline_license().is_none());
+
+    let err = client.login("XXXX-XXXX-XXXX-XXXX").unwrap_err();
+    assert!(matches!(err, AuthForgeError::InvalidApp));
 }
 
 /// Minimal one-shot HTTP server that records the request body it receives
@@ -220,7 +223,12 @@ fn offline_self_ban_is_local_error_and_never_posts() {
     let vectors = load_vectors();
     let good = case(&vectors, "good_lifetime");
     let (base_url, body_rx) = capture_server();
-    let (client, _) = make_client(&good, |cfg| cfg.api_base_url = base_url);
+    let (client, _) = make_client(&good, |cfg| {
+        cfg.api_base_url = base_url;
+        // Explicit-license self_ban is an online API; this test covers that
+        // dual-mode path. Offline-only clients omit the secret entirely.
+        cfg.app_secret = "online-selfban".to_string();
+    });
     client.login_from_file(&good.file).expect("login from file");
 
     for revoke in [true, false] {
