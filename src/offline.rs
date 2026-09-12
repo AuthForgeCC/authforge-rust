@@ -453,7 +453,8 @@ const ACTIVATION_REQUEST_VERSION: u64 = 1;
 const ACTIVATION_REQUEST_TYP: &str = "authforge-activation-request";
 const BEGIN_ACTIVATION_REQUEST: &str = "-----BEGIN AUTHFORGE ACTIVATION REQUEST-----";
 const END_ACTIVATION_REQUEST: &str = "-----END AUTHFORGE ACTIVATION REQUEST-----";
-const ACTIVATION_REQUEST_SDK_TAG: &str = "rust/1.2.1";
+// Derived from Cargo.toml so a version bump cannot leave this behind.
+const ACTIVATION_REQUEST_SDK_TAG: &str = concat!("rust/", env!("CARGO_PKG_VERSION"));
 const ARMOR_LINE_WIDTH: usize = 64;
 const MAX_REQUEST_HWID: usize = 256;
 const MAX_REQUEST_MACHINE_NAME: usize = 128;
