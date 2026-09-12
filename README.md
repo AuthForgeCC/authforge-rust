@@ -169,8 +169,8 @@ let client = AuthForgeClient::new(AuthForgeConfig {
     ..Default::default()
 });
 
-// 1. The customer sends you this value so you can bind the file to their machine:
-println!("HWID: {}", client.hwid());
+// 1. Write an activation request the operator drops into the mint dialog:
+std::fs::write("machine.authforge-request", client.create_activation_request(Default::default())).expect("write request");
 
 // 2. Later, authorize from the minted file (path or armored text). No network.
 match client.login_from_file("license.authforge") {
@@ -228,6 +228,7 @@ With online check-ins, a desktop app running 6h/day at a 15-minute interval burn
 - `get_offline_license(&self) -> Option<OfflineLicense>`: the offline file in use (`jti`, `expires_at`, `hwid_policy`, …)
 - `get_session_kind(&self) -> Option<SessionKind>`: `Some(SessionKind::Online)`, `Some(SessionKind::Offline)`, or `None` when logged out
 - `hwid(&self) -> &str`: the HWID this client sends (or `hwid_override`); customers share it to receive a bound file
+- `create_activation_request(&self, opts) -> String`: unsigned `.authforge-request` for this machine. No network, no secret. Hostname omitted unless `include_machine_name`
 - `logout(&self)`
 - `is_authenticated(&self) -> bool`
 - `get_session_data(&self) -> Option<serde_json::Value>`

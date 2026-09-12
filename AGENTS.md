@@ -7,7 +7,7 @@
 
 AuthForge is a license key validation service. Your app activates online: it sends a license key + hardware ID to `POST /auth/validate`, and the server checks revocation, expiry, HWID binding, and credits, then returns an Ed25519-signed session with a TTL. By default the app then runs through the **grace period**: it keeps running on the signed session with no further network calls until the session TTL expires (server default 24h, clamped 1h to 7d). Optionally, enable **online check-ins** (`online_heartbeat: true`) to send periodic `POST /auth/heartbeat` requests for fast revocation and concurrent-use detection. When the grace period expires or a check-in fails, `on_failure` is invoked and you handle it (typically exit the app).
 
-There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `login_from_file` verifies it locally with the app public key and the machine HWID, with zero network calls. Do not ship the App Secret in those builds (leave `app_secret` empty). Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `login` + grace period.
+There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `login_from_file` verifies it locally with the app public key and the machine HWID, with zero network calls. Do not ship the App Secret in those builds (leave `app_secret` empty). Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `login` + grace period. To collect the HWID for a bound file, write an **activation request** (`.authforge-request`) with `create_activation_request`. It is not a license, is not signed, and does not mint anything. Prefer it over printing the raw HWID.
 
 ## Billing model (so you can pick sensible intervals)
 
@@ -103,6 +103,7 @@ For Telegram/Discord bot flows, prefer immutable IDs (`tg:<user_id>`, `discord:<
 | `get_offline_license(&self)` | `Option<OfflineLicense>` | `jti`, `expires_at`, `hwid_policy`, … of the offline file in use |
 | `get_session_kind(&self)` | `Option<SessionKind>` | `Some(Online)`, `Some(Offline)`, or `None` when logged out |
 | `hwid(&self)` | `&str` | HWID this client sends; the customer reports it so the operator can mint a bound file |
+| `create_activation_request(&self, opts)` | `String` | Unsigned `.authforge-request` for this machine. No network, no secret, callable before `login`. Hostname omitted unless `include_machine_name` |
 | `logout(&self)` | `()` | Stops background checks and clears state |
 | `is_authenticated(&self)` | `bool` | Whether authenticated |
 | `get_session_data(&self)` | `Option<serde_json::Value>` | Session payload |

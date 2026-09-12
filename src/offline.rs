@@ -38,6 +38,8 @@ use serde_json::Value;
 
 use crate::verify_payload_signature_ed25519_any;
 
+use sha2::{Digest, Sha256};
+
 /// The only `.authforge` format version this SDK accepts.
 pub const OFFLINE_LICENSE_FILE_VERSION: u64 = 1;
 
@@ -441,6 +443,196 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+// ---------------------------------------------------------------------------
+// Activation requests (`.authforge-request`)
+// ---------------------------------------------------------------------------
+
+const ACTIVATION_REQUEST_VERSION: u64 = 1;
+const ACTIVATION_REQUEST_TYP: &str = "authforge-activation-request";
+const BEGIN_ACTIVATION_REQUEST: &str = "-----BEGIN AUTHFORGE ACTIVATION REQUEST-----";
+const END_ACTIVATION_REQUEST: &str = "-----END AUTHFORGE ACTIVATION REQUEST-----";
+const ACTIVATION_REQUEST_SDK_TAG: &str = "rust/1.2.1";
+const ARMOR_LINE_WIDTH: usize = 64;
+const MAX_REQUEST_HWID: usize = 256;
+const MAX_REQUEST_MACHINE_NAME: usize = 128;
+const MAX_REQUEST_OS: usize = 64;
+const MAX_REQUEST_SDK: usize = 64;
+const MAX_REQUEST_LICENSE_KEY: usize = 64;
+
+/// Optional fields for [`crate::AuthForgeClient::create_activation_request`].
+/// `machine_name` is omitted unless `include_machine_name` is true.
+#[derive(Debug, Clone, Default)]
+pub struct ActivationRequestOptions {
+    pub include_machine_name: bool,
+    pub machine_name: Option<String>,
+    pub os: Option<String>,
+    pub omit_os: bool,
+    pub sdk: Option<String>,
+    pub omit_sdk: bool,
+    pub license_key: Option<String>,
+    pub created_at: Option<String>
+}
+
+fn clip_request_field(value: &str, max: usize) -> &str {
+    if value.len() <= max {
+        value
+    } else {
+        &value[..max]
+    }
+}
+
+fn json_escape_request(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c)
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn wrap_armor_64(value: &str) -> String {
+    let mut lines = Vec::new();
+    let mut i = 0;
+    while i < value.len() {
+        let end = (i + ARMOR_LINE_WIDTH).min(value.len());
+        lines.push(&value[i..end]);
+        i = end;
+    }
+    lines.join("\n")
+}
+
+fn detect_os_label() -> String {
+    let label = match std::env::consts::OS {
+        "windows" => format!("Windows {}", std::env::consts::ARCH),
+        "macos" => format!("macOS {}", std::env::consts::ARCH),
+        "linux" => format!("Linux {}", std::env::consts::ARCH),
+        other => other.to_string()
+    };
+    clip_request_field(&label, MAX_REQUEST_OS).to_string()
+}
+
+fn canonical_activation_request_json(
+    app_id: &str,
+    hwid: &str,
+    created_at: &str,
+    machine_name: Option<&str>,
+    os: Option<&str>,
+    sdk: Option<&str>,
+    license_key: Option<&str>
+) -> String {
+    let mut parts = vec![
+        format!("\"v\":{ACTIVATION_REQUEST_VERSION}"),
+        format!("\"typ\":{}", json_escape_request(ACTIVATION_REQUEST_TYP)),
+        format!("\"appId\":{}", json_escape_request(app_id)),
+        format!("\"hwid\":{}", json_escape_request(clip_request_field(hwid, MAX_REQUEST_HWID))),
+        format!("\"createdAt\":{}", json_escape_request(created_at))
+    ];
+    if let Some(name) = machine_name.filter(|s| !s.is_empty()) {
+        parts.push(format!(
+            "\"machineName\":{}",
+            json_escape_request(clip_request_field(name, MAX_REQUEST_MACHINE_NAME))
+        ));
+    }
+    if let Some(os_name) = os.filter(|s| !s.is_empty()) {
+        parts.push(format!(
+            "\"os\":{}",
+            json_escape_request(clip_request_field(os_name, MAX_REQUEST_OS))
+        ));
+    }
+    if let Some(sdk) = sdk.filter(|s| !s.is_empty()) {
+        parts.push(format!(
+            "\"sdk\":{}",
+            json_escape_request(clip_request_field(sdk, MAX_REQUEST_SDK))
+        ));
+    }
+    if let Some(key) = license_key.filter(|s| !s.is_empty()) {
+        parts.push(format!(
+            "\"licenseKey\":{}",
+            json_escape_request(clip_request_field(key, MAX_REQUEST_LICENSE_KEY))
+        ));
+    }
+    format!("{{{}}}", parts.join(","))
+}
+
+fn utc_iso_ms_now() -> String {
+    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    civil_iso(dur.as_secs(), dur.subsec_millis())
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d)
+}
+
+fn civil_iso(secs: u64, millis: u32) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = rem / 3_600;
+    let minute = (rem % 3_600) / 60;
+    let second = rem % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+/// Armored `.authforge-request` text from explicit fields.
+pub fn format_activation_request(
+    app_id: &str,
+    hwid: &str,
+    created_at: &str,
+    machine_name: Option<&str>,
+    os: Option<&str>,
+    sdk: Option<&str>,
+    license_key: Option<&str>
+) -> String {
+    let json = canonical_activation_request_json(app_id, hwid, created_at, machine_name, os, sdk, license_key);
+    let payload_b64 = STANDARD.encode(json.as_bytes());
+    let checksum = format!("{:x}", Sha256::digest(payload_b64.as_bytes()));
+    let checksum16 = &checksum[..16];
+    let clean = app_id.replace(['\r', '\n'], " ");
+    [
+        BEGIN_ACTIVATION_REQUEST,
+        &format!("Version: {ACTIVATION_REQUEST_VERSION}"),
+        &format!("App-Id: {}", clean.trim()),
+        &format!("Checksum: {checksum16}"),
+        "",
+        &wrap_armor_64(&payload_b64),
+        END_ACTIVATION_REQUEST,
+        ""
+    ]
+    .join("\n")
+}
+
+pub(crate) fn sdk_tag() -> &'static str {
+    ACTIVATION_REQUEST_SDK_TAG
+}
+
+pub(crate) fn default_os_label() -> String {
+    detect_os_label()
+}
+
+pub(crate) fn now_iso_ms() -> String {
+    utc_iso_ms_now()
 }
 
 #[cfg(test)]

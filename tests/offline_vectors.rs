@@ -6,8 +6,8 @@ use std::thread;
 use std::time::Duration;
 
 use authforge::{
-    parse_iso8601_ms, parse_license_file, verify_license_file, AuthForgeClient, AuthForgeConfig,
-    AuthForgeError, OfflineHwidPolicy, OfflineLicenseError, SessionKind, VerifyLicenseFileOptions
+    format_activation_request, parse_iso8601_ms, parse_license_file, verify_license_file, AuthForgeClient, AuthForgeConfig,
+    ActivationRequestOptions, AuthForgeError, OfflineHwidPolicy, OfflineLicenseError, SessionKind, VerifyLicenseFileOptions
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -320,4 +320,75 @@ fn login_from_file_reads_from_disk_and_verify_is_side_effect_free() {
     assert!(matches!(client.login_from_file(&missing), Err(OfflineLicenseError::ReadError(_))));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[derive(Deserialize)]
+struct ActivationRequestVectors {
+    cases: Vec<ActivationRequestCase>
+}
+
+#[derive(Deserialize)]
+struct ActivationRequestCase {
+    name: String,
+    file: String,
+    inputs: Option<ActivationRequestInputs>
+}
+
+#[derive(Deserialize)]
+struct ActivationRequestInputs {
+    #[serde(rename = "appId")]
+    app_id: String,
+    hwid: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    #[serde(rename = "machineName")]
+    machine_name: Option<String>,
+    os: Option<String>,
+    sdk: Option<String>,
+    #[serde(rename = "licenseKey")]
+    license_key: Option<String>
+}
+
+#[test]
+fn create_activation_request_matches_vectors() {
+    let vectors: ActivationRequestVectors =
+        serde_json::from_str(include_str!("../activation_request_vectors.json")).expect("valid request vector json");
+    let dummy_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    for c in &vectors.cases {
+        let Some(inputs) = &c.inputs else {
+            continue;
+        };
+        let client = AuthForgeClient::new(AuthForgeConfig {
+            app_id: inputs.app_id.clone(),
+            app_secret: String::new(),
+            public_key: dummy_key.to_string(),
+            hwid_override: Some(inputs.hwid.clone()),
+            ..Default::default()
+        });
+        let got = client.create_activation_request(ActivationRequestOptions {
+            created_at: Some(inputs.created_at.clone()),
+            omit_os: inputs.os.is_none(),
+            omit_sdk: inputs.sdk.is_none(),
+            include_machine_name: inputs.machine_name.is_some(),
+            machine_name: inputs.machine_name.clone(),
+            os: inputs.os.clone(),
+            sdk: inputs.sdk.clone(),
+            license_key: Some(inputs.license_key.clone().unwrap_or_default())
+        });
+        assert_eq!(got, c.file, "case {}", c.name);
+        assert_eq!(
+            format_activation_request(
+                &inputs.app_id,
+                &inputs.hwid,
+                &inputs.created_at,
+                inputs.machine_name.as_deref(),
+                inputs.os.as_deref(),
+                inputs.sdk.as_deref(),
+                inputs.license_key.as_deref()
+            ),
+            c.file,
+            "format_activation_request {}",
+            c.name
+        );
+    }
 }

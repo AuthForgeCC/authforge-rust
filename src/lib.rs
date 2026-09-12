@@ -15,8 +15,9 @@ use ureq::{Agent, Error as UreqError};
 mod offline;
 
 pub use offline::{
-    parse_iso8601_ms, parse_license_file, verify_license_file, OfflineHwidPolicy, OfflineLicense,
-    OfflineLicenseError, ParsedLicenseFile, VerifyLicenseFileOptions, OFFLINE_LICENSE_FILE_VERSION
+    format_activation_request, parse_iso8601_ms, parse_license_file, verify_license_file,
+    ActivationRequestOptions, OfflineHwidPolicy, OfflineLicense, OfflineLicenseError,
+    ParsedLicenseFile, VerifyLicenseFileOptions, OFFLINE_LICENSE_FILE_VERSION
 };
 
 const DEFAULT_API_BASE_URL: &str = "https://auth.authforge.cc";
@@ -587,6 +588,52 @@ impl AuthForgeClient {
     /// an offline `.authforge` file can be bound to it.
     pub fn hwid(&self) -> &str {
         &self.inner.hwid
+    }
+
+    /// Build an activation request (`.authforge-request`) for this machine.
+    /// No network, no session, no app secret. `machine_name` is omitted
+    /// unless `opts.include_machine_name` is true.
+    pub fn create_activation_request(&self, opts: ActivationRequestOptions) -> String {
+        let created_at = opts.created_at.unwrap_or_else(offline::now_iso_ms);
+        let machine_name = if opts.include_machine_name {
+            opts.machine_name.or_else(|| hostname::get().ok().and_then(|h| h.into_string().ok()))
+        } else {
+            None
+        };
+        let os = if opts.omit_os {
+            None
+        } else {
+            Some(opts.os.unwrap_or_else(offline::default_os_label))
+        };
+        let sdk = if opts.omit_sdk {
+            None
+        } else {
+            Some(opts.sdk.unwrap_or_else(|| offline::sdk_tag().to_string()))
+        };
+        let license_key = match opts.license_key {
+            Some(key) => {
+                if key.is_empty() {
+                    None
+                } else {
+                    Some(key)
+                }
+            }
+            None => self
+                .inner
+                .state
+                .lock()
+                .ok()
+                .and_then(|state| state.license_key.clone())
+        };
+        format_activation_request(
+            &self.inner.cfg.app_id,
+            &self.inner.hwid,
+            &created_at,
+            machine_name.as_deref(),
+            os.as_deref(),
+            sdk.as_deref(),
+            license_key.as_deref()
+        )
     }
 
     /// Authorize from a cloud-minted offline license file (`.authforge`) with
