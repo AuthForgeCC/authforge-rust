@@ -968,7 +968,7 @@ impl AuthForgeClient {
 
     /// Grace period check: no network. Confirms the session is still
     /// authenticated and the stored expiry has not passed, failing with
-    /// `SessionExpired` once the grace period (the session TTL) runs out.
+    /// `Expired` once the grace period (the session TTL) runs out.
     fn grace_period_check(&self) -> Result<(), AuthForgeError> {
         let (authenticated, expires_in) = {
             let state = self
@@ -980,13 +980,13 @@ impl AuthForgeClient {
         };
 
         if !authenticated {
-            return Err(AuthForgeError::SessionExpired);
+            return Err(AuthForgeError::Expired);
         }
 
-        let expires = expires_in.ok_or(AuthForgeError::SessionExpired)?;
+        let expires = expires_in.ok_or(AuthForgeError::Expired)?;
         let now = epoch_now();
         if now >= expires {
-            return Err(AuthForgeError::SessionExpired);
+            return Err(AuthForgeError::Expired);
         }
 
         Ok(())
@@ -1173,8 +1173,9 @@ impl AuthForgeClient {
         }
 
         // A transient failure can't extend the session past its signed TTL.
+        // Local TTL expiry reports `Expired`, like the grace period check.
         let failure = if err.is_transient() && self.local_session_expired() {
-            AuthForgeError::SessionExpired
+            AuthForgeError::Expired
         } else {
             err
         };
@@ -1185,7 +1186,7 @@ impl AuthForgeClient {
         if let Some(callback) = &self.inner.cfg.on_heartbeat_failure {
             callback(&failure);
         } else if let Some(callback) = &self.inner.cfg.on_failure {
-            callback(&failure.to_string());
+            callback(&format!("{failure:?}"));
         }
         !fatal
     }
@@ -1299,11 +1300,51 @@ impl Drop for AuthForgeClient {
 }
 
 #[cfg(test)]
-mod validate_license_tests {
-    use super::*;
+mod mock_http {
     use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    /// Reads the whole request, headers plus `Content-Length` body. Closing a
+    /// socket with unread request bytes resets the connection on Windows, and
+    /// the client reports that as a network error.
+    pub(crate) fn read_request(stream: &mut TcpStream) {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            if let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if data.len() >= end + 4 + length {
+                    return;
+                }
+            }
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => data.extend_from_slice(&buf[..read])
+            }
+        }
+    }
+
+    pub(crate) fn write_response(stream: &mut TcpStream, status: u16, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod validate_license_tests {
+    use super::mock_http::{read_request, write_response};
+    use super::*;
     use std::net::TcpListener;
-    use std::sync::mpsc;
     use std::thread;
 
     #[test]
@@ -1320,21 +1361,11 @@ mod validate_license_tests {
         let run_server = |body: String| {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let addr = listener.local_addr().unwrap();
-            let (tx, rx) = mpsc::channel::<()>();
             thread::spawn(move || {
-                let _ = tx.send(());
                 let (mut stream, _) = listener.accept().expect("accept");
-                let mut buf = [0u8; 8192];
-                let _ = stream.read(&mut buf);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes());
+                read_request(&mut stream);
+                write_response(&mut stream, 200, &body);
             });
-            rx.recv_timeout(std::time::Duration::from_secs(2))
-                .expect("server thread started");
             addr
         };
 
@@ -1431,10 +1462,10 @@ mod validate_license_tests {
 
 #[cfg(test)]
 mod heartbeat_tests {
+    use super::mock_http::{read_request, write_response};
     use super::*;
     use std::cell::RefCell;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
 
@@ -1544,37 +1575,6 @@ mod heartbeat_tests {
         fn requests(&self) -> usize {
             self.requests.load(Ordering::SeqCst)
         }
-    }
-
-    fn read_request(stream: &mut TcpStream) {
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-        let mut data = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            if let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
-                let length = headers
-                    .lines()
-                    .find_map(|line| line.strip_prefix("content-length:"))
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-                    .unwrap_or(0);
-                if data.len() >= end + 4 + length {
-                    return;
-                }
-            }
-            match stream.read(&mut buf) {
-                Ok(0) | Err(_) => return,
-                Ok(read) => data.extend_from_slice(&buf[..read])
-            }
-        }
-    }
-
-    fn write_response(stream: &mut TcpStream, status: u16, body: &str) {
-        let response = format!(
-            "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = stream.write_all(response.as_bytes());
     }
 
     fn closed_port_url() -> String {
@@ -1837,12 +1837,12 @@ mod heartbeat_tests {
     }
 
     #[test]
-    fn transient_failure_after_ttl_becomes_session_expired() {
+    fn transient_failure_after_ttl_becomes_expired() {
         let harness = Harness::new(vec![failed(500, "system_error")]);
         seed_session(&harness.client, SEED_TOKEN, epoch_now() - 1);
         let keep_checking = harness.tick();
-        harness.assert_fatal(keep_checking, "session_expired", 1);
-        assert!(matches!(harness.only_failure(), AuthForgeError::SessionExpired));
+        harness.assert_fatal(keep_checking, "expired", 1);
+        assert!(matches!(harness.only_failure(), AuthForgeError::Expired));
     }
 
     #[test]
@@ -1864,24 +1864,24 @@ mod heartbeat_tests {
     }
 
     #[test]
-    fn grace_period_expiry_is_session_expired() {
+    fn grace_period_expiry_is_expired() {
         let harness = Harness::with(Vec::new(), |config| config.online_heartbeat = false);
         assert!(harness.tick());
         assert!(harness.failures.lock().expect("failures").is_empty());
 
         seed_session(&harness.client, SEED_TOKEN, epoch_now() - 1);
         let keep_checking = harness.tick();
-        harness.assert_fatal(keep_checking, "session_expired", 0);
-        assert!(matches!(harness.only_failure(), AuthForgeError::SessionExpired));
+        harness.assert_fatal(keep_checking, "expired", 0);
+        assert!(matches!(harness.only_failure(), AuthForgeError::Expired));
 
         let harness = Harness::with(Vec::new(), |config| config.online_heartbeat = false);
         harness.client.inner.state.lock().expect("state").authenticated = false;
         let keep_checking = harness.tick();
-        harness.assert_fatal(keep_checking, "session_expired", 0);
+        harness.assert_fatal(keep_checking, "expired", 0);
     }
 
     #[test]
-    fn legacy_on_failure_receives_the_display_form() {
+    fn legacy_on_failure_receives_the_debug_form() {
         let server = MockServer::start(vec![failed(410, "revoked")]);
         let messages = Arc::new(Mutex::new(Vec::<String>::new()));
         let legacy = Arc::clone(&messages);
@@ -1892,7 +1892,7 @@ mod heartbeat_tests {
         });
         use_heartbeat_nonce();
         assert!(!client.heartbeat_tick());
-        assert_eq!(*messages.lock().expect("messages"), vec!["revoked".to_string()]);
+        assert_eq!(*messages.lock().expect("messages"), vec!["Revoked".to_string()]);
         assert!(!client.is_authenticated());
     }
 
