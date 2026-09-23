@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.1
+
+### Fixes
+
+- **Transient failures are no longer silent without a callback.** With neither `on_heartbeat_failure` nor `on_failure` set, a transient background check failure now writes one line to stderr, `AuthForge: background check failed (<code>); retrying next interval`, and checks in again on the next interval as before. Definitive failures, including the TTL-promoted `Expired`, still clear the session and stop background checks without output; the Rust SDK still never exits the process.
+
+### Docs
+
+- The README and `AGENTS.md` examples no longer call `std::process::exit(1)` from the failure callback. The callback sends on an `mpsc` channel that the main thread receives from, so it can save work and exit; exiting from the callback is kept as a last resort after saving.
+
 ## 1.4.0
 
 ### Behavior changes for callers

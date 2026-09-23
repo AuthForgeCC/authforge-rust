@@ -71,24 +71,36 @@ Adjust the path to match your layout (for example `vendor/authforge-rust`).
 Activate online once at startup; the app then runs through the grace period with no further network calls:
 
 ```rust
-use authforge::{AuthForgeClient, AuthForgeConfig};
+use authforge::{AuthForgeClient, AuthForgeConfig, AuthForgeError};
+use std::sync::mpsc;
 
 fn main() {
+    let (license_lost, lost) = mpsc::channel::<AuthForgeError>();
     let client = AuthForgeClient::new(AuthForgeConfig {
         app_id: "your-app-id".into(),
         app_secret: "your-app-secret".into(),
         public_key: "your-public-key".into(),
-        on_failure: Some(Box::new(|err| {
-            eprintln!("Auth failed: {}", err);
-            std::process::exit(1);
+        on_heartbeat_failure: Some(Box::new(move |err: &AuthForgeError| {
+            if err.is_fatal() {
+                // Runs on the heartbeat thread: signal main instead of exiting here.
+                let _ = license_lost.send(err.clone());
+            }
         })),
         ..Default::default()
     });
 
     match client.login("XXXX-XXXX-XXXX-XXXX") {
         Ok(result) => println!("Activated! Grace period seconds remaining: {}", result.expires_in),
-        Err(e) => eprintln!("Activation failed: {:?}", e),
+        Err(e) => {
+            eprintln!("Activation failed: {:?}", e);
+            std::process::exit(1);
+        }
     }
+
+    let err = lost.recv().expect("client dropped"); // your app's work runs elsewhere until this fires
+    eprintln!("Auth failed: {}", err.code());
+    // Save the user's work here, then exit.
+    std::process::exit(1);
 }
 ```
 
@@ -151,7 +163,7 @@ Either way, the grace period is session continuation after one successful online
 
 ## Background check failures
 
-Each failed grace period check or online check-in is reported once, to `on_heartbeat_failure` (or, if that isn't set, to `on_failure` as the error's `Debug` string). The reason is `err.code()`, and `err.is_transient()` / `err.is_fatal()` tell you what the SDK did about it:
+Each failed grace period check or online check-in is reported once, to `on_heartbeat_failure` (or, if that isn't set, to `on_failure` as the error's `Debug` string). Without a callback, a transient failure prints `AuthForge: background check failed (<code>); retrying next interval` to stderr and checks again next interval; a fatal one (including `Expired`) clears the session and stops background checks without output, and the process keeps running, so check `is_authenticated()` or set a callback. The reason is `err.code()`, and `err.is_transient()` / `err.is_fatal()` tell you what the SDK did about it:
 
 | Classification | Codes | What the SDK does |
 | --- | --- | --- |
@@ -160,25 +172,42 @@ Each failed grace period check or online check-in is reported once, to `on_heart
 
 On check-ins, `hwid_mismatch` means this HWID is no longer bound to the license (for example after an HWID reset in the dashboard), and `blocked` means the HWID or IP is blacklisted, or isn't on the app's whitelist. A failed check-in only counts as a server verdict when its body is a JSON object with `"status": "failed"` and a non-empty `error`; any other failure body is the transient `unexpected_response`. `authforge::is_transient_error_code(code)` applies the same classification to a code string.
 
+To tolerate short outages but shut down on a definitive answer, have the callback signal your main thread and let it save and exit:
+
 ```rust
 use authforge::{AuthForgeClient, AuthForgeConfig, AuthForgeError};
+use std::sync::mpsc;
+
+let (license_lost, lost) = mpsc::channel::<AuthForgeError>();
 
 let client = AuthForgeClient::new(AuthForgeConfig {
     app_id: "YOUR_APP_ID".into(),
     app_secret: "YOUR_APP_SECRET".into(),
     public_key: "YOUR_PUBLIC_KEY".into(),
     online_heartbeat: true,
-    on_heartbeat_failure: Some(Box::new(|err: &AuthForgeError| {
+    on_heartbeat_failure: Some(Box::new(move |err: &AuthForgeError| {
         if err.is_transient() {
             eprintln!("authforge: check-in failed ({}), retrying next interval", err.code());
             return;
         }
         eprintln!("authforge: license no longer valid: {}", err.code());
-        std::process::exit(1);
+        // Runs on the heartbeat thread: signal the main thread instead of exiting here.
+        let _ = license_lost.send(err.clone());
     })),
     ..Default::default()
 });
+
+// ... login ...
+
+while lost.try_recv().is_err() {
+    do_one_unit_of_work(); // keep units short so the loop notices the signal quickly
+}
+save_user_work();
+client.logout();
+std::process::exit(1);
 ```
+
+Calling `std::process::exit(1)` inside the callback is a last resort: no destructors run on any thread, so save the user's work first.
 
 **Thread safety**: session state is only read and written under the client's internal lock, and callbacks run on the heartbeat thread with no SDK lock held. Calling `logout()` or `is_authenticated()` from a callback, or dropping the client there, is safe. A check-in still in flight when `logout()` or a new `login()` runs never writes its result to the new session.
 

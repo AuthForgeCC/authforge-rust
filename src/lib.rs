@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -75,7 +76,9 @@ pub struct AuthForgeConfig {
     /// the session when it runs; transient ones keep checking in. It runs on
     /// the heartbeat thread with no SDK lock held, so it may call
     /// [`AuthForgeClient::logout`], [`AuthForgeClient::is_authenticated`] or
-    /// drop the client.
+    /// drop the client. With neither callback set, a transient failure prints
+    /// a one-line warning to stderr and a fatal one clears the session
+    /// silently.
     pub on_heartbeat_failure: Option<Box<HeartbeatFailureCallback>>,
     pub request_timeout: u64,
     /// HTTP timeout in seconds for `/auth/heartbeat` only. Use a value smaller
@@ -235,6 +238,11 @@ pub fn is_transient_error_code(code: &str) -> bool {
     !DEFINITIVE_ERROR_CODES.contains(&code)
 }
 
+fn warn_to_stderr(message: &str) {
+    // eprintln! panics when stderr is closed; a warning must not stop check-ins.
+    let _ = writeln!(io::stderr(), "{message}");
+}
+
 #[derive(Clone)]
 struct RuntimeConfig {
     app_id: String,
@@ -309,7 +317,8 @@ struct ClientInner {
     heartbeat_wake: Mutex<()>,
     heartbeat_wake_cvar: Condvar,
     heartbeat_handle: Mutex<Option<JoinHandle<()>>>,
-    sleep: fn(Duration)
+    sleep: fn(Duration),
+    warn: fn(&str)
 }
 
 impl ClientInner {
@@ -490,7 +499,8 @@ impl AuthForgeClient {
             heartbeat_wake: Mutex::new(()),
             heartbeat_wake_cvar: Condvar::new(),
             heartbeat_handle: Mutex::new(None),
-            sleep: thread::sleep
+            sleep: thread::sleep,
+            warn: warn_to_stderr
         };
 
         Self {
@@ -1151,7 +1161,8 @@ impl AuthForgeClient {
     }
 
     /// Runs one background check and reports whether checks should continue.
-    /// Transient failures keep the session and check in again next interval.
+    /// Transient failures keep the session and check in again next interval;
+    /// with no callback set they print a one-line warning to stderr.
     /// Definitive failures clear the session first (as [`Self::logout`]
     /// does), so neither the grace period nor [`Self::is_authenticated`]
     /// keeps the app running on it.
@@ -1187,6 +1198,11 @@ impl AuthForgeClient {
             callback(&failure);
         } else if let Some(callback) = &self.inner.cfg.on_failure {
             callback(&format!("{failure:?}"));
+        } else if !fatal {
+            (self.inner.warn)(&format!(
+                "AuthForge: background check failed ({}); retrying next interval",
+                failure.code()
+            ));
         }
         !fatal
     }
@@ -1485,6 +1501,18 @@ mod heartbeat_tests {
         SLEEPS.with(|sleeps| std::mem::take(&mut *sleeps.borrow_mut()))
     }
 
+    thread_local! {
+        static WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn record_warning(message: &str) {
+        WARNINGS.with(|warnings| warnings.borrow_mut().push(message.to_string()));
+    }
+
+    fn take_warnings() -> Vec<String> {
+        WARNINGS.with(|warnings| std::mem::take(&mut *warnings.borrow_mut()))
+    }
+
     fn use_heartbeat_nonce() {
         TEST_NONCE.with(|nonce| *nonce.borrow_mut() = Some(HEARTBEAT_NONCE.to_string()));
     }
@@ -1608,7 +1636,9 @@ mod heartbeat_tests {
         };
         configure(&mut config);
         let mut client = AuthForgeClient::new(config);
-        Arc::get_mut(&mut client.inner).expect("unique client").sleep = record_sleep;
+        let inner = Arc::get_mut(&mut client.inner).expect("unique client");
+        inner.sleep = record_sleep;
+        inner.warn = record_warning;
         seed_session(&client, SEED_TOKEN, epoch_now() + 3600);
         client
     }
@@ -1894,6 +1924,42 @@ mod heartbeat_tests {
         assert!(!client.heartbeat_tick());
         assert_eq!(*messages.lock().expect("messages"), vec!["Revoked".to_string()]);
         assert!(!client.is_authenticated());
+    }
+
+    #[test]
+    fn without_callbacks_a_transient_failure_warns_and_keeps_checking_in() {
+        let server = MockServer::start(vec![failed(503, "system_error")]);
+        let client = client_with(&server.url, |_| {});
+        take_warnings();
+        use_heartbeat_nonce();
+        assert!(client.heartbeat_tick());
+        assert_eq!(
+            take_warnings(),
+            vec!["AuthForge: background check failed (system_error); retrying next interval".to_string()]
+        );
+        assert!(client.is_authenticated());
+        assert_eq!(session_token(&client).as_deref(), Some(SEED_TOKEN));
+    }
+
+    /// The Rust SDK never exits the process: with no callback a definitive
+    /// failure, including the TTL-promoted `Expired`, ends the session silently.
+    #[test]
+    fn without_callbacks_a_definitive_failure_ends_the_session_silently() {
+        let cases = [
+            (failed(410, "revoked"), epoch_now() + 3600),
+            (failed(503, "system_error"), epoch_now() - 1)
+        ];
+        for (reply, expires_in) in cases {
+            let server = MockServer::start(vec![reply]);
+            let client = client_with(&server.url, |_| {});
+            seed_session(&client, SEED_TOKEN, expires_in);
+            take_warnings();
+            use_heartbeat_nonce();
+            assert!(!client.heartbeat_tick());
+            assert!(take_warnings().is_empty());
+            assert!(!client.is_authenticated());
+            assert_eq!(session_token(&client), None);
+        }
     }
 
     #[test]

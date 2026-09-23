@@ -25,17 +25,24 @@ The crate is **`authforge`** on [crates.io](https://crates.io/crates/authforge).
 Activate online once at startup; the default grace period handles the rest with no network calls:
 
 ```rust
-use authforge::{AuthForgeClient, AuthForgeConfig};
+use authforge::{AuthForgeClient, AuthForgeConfig, AuthForgeError};
 use std::process;
+use std::sync::mpsc;
 
 fn main() {
+    // Receives the failure that ended the license; main saves work, then exits.
+    let (license_lost, lost) = mpsc::channel::<AuthForgeError>();
     let client = AuthForgeClient::new(AuthForgeConfig {
         app_id: "YOUR_APP_ID".into(),
         app_secret: "YOUR_APP_SECRET".into(),
         public_key: "YOUR_PUBLIC_KEY".into(), // required: base64 Ed25519 key from the dashboard
-        on_failure: Some(Box::new(|msg: &str| {
-            eprintln!("AuthForge: {msg}");
-            process::exit(1);
+        on_heartbeat_failure: Some(Box::new(move |err: &AuthForgeError| {
+            if err.is_transient() {
+                return; // network blip / rate_limited: the SDK checks in again next interval
+            }
+            eprintln!("AuthForge: {}", err.code());
+            // Runs on the heartbeat thread: signal main, do not process::exit here.
+            let _ = license_lost.send(err.clone());
         })),
         ..Default::default()
     });
@@ -52,14 +59,26 @@ fn main() {
     }
 
     // --- Your application code starts here ---
-    run_app();
+    let license_was_lost = run_app(&lost);
     // --- Your application code ends here ---
 
     client.logout();
+    if license_was_lost {
+        process::exit(1);
+    }
 }
 
-fn run_app() {
+/// Returns `true` if it stopped because the license was lost.
+fn run_app(lost: &mpsc::Receiver<AuthForgeError>) -> bool {
     println!("Running with a valid license.");
+    // Do the work in short units and check for the signal between them.
+    loop {
+        if lost.try_recv().is_ok() {
+            // Save the user's work here before returning.
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
 ```
 
@@ -176,29 +195,35 @@ Handle `AuthForgeError` from `login` or `validate_license`. Background check fai
 
 ```rust
 use authforge::{AuthForgeClient, AuthForgeConfig, AuthForgeError};
+use std::sync::mpsc;
+
+let (license_lost, lost) = mpsc::channel::<AuthForgeError>();
 
 let client = AuthForgeClient::new(AuthForgeConfig {
     app_id: "YOUR_APP_ID".into(),
     app_secret: "YOUR_APP_SECRET".into(),
     public_key: "YOUR_PUBLIC_KEY".into(),
     online_heartbeat: true,
-    on_heartbeat_failure: Some(Box::new(|err: &AuthForgeError| {
+    on_heartbeat_failure: Some(Box::new(move |err: &AuthForgeError| {
         if err.is_transient() {
             eprintln!("AuthForge: check-in failed ({}), retrying next interval", err.code());
             return;
         }
         eprintln!("AuthForge: license no longer valid: {}", err.code());
-        std::process::exit(1);
+        let _ = license_lost.send(err.clone()); // main thread checks `lost`, saves, then exits
     })),
     ..Default::default()
 });
 ```
 
+`std::process::exit(1)` inside the callback is a last resort: no destructors run, so save the user's work first.
+
 ## Do NOT
 
 - Do not hardcode the app secret as a plain string literal in source; use environment variables or encrypted config
 - Do not embed the App Secret in air-gapped / `login_from_file` builds; leave `app_secret` empty (`Default` already does); verification only needs app id + public key
-- Do not omit `on_heartbeat_failure` (or `on_failure`) if you need controlled shutdown; checks run in a background thread and failures are reported through this callback
+- Do not omit `on_heartbeat_failure` (or `on_failure`) if you need controlled shutdown; checks run in a background thread and failures are reported through this callback. Without one, transient failures only print a stderr warning and fatal ones (including `Expired`) clear the session silently; the SDK never exits the process for you
+- Do not call `std::process::exit` from the callback as the normal shutdown path: send on an `mpsc` channel so the main thread can save work and exit
 - Do not exit on transient background failures (`err.is_transient()`); the SDK keeps the session and checks in again, and only definitive failures end it
 - Do not call `login` on every app action; call once at startup, the grace period (or online check-ins) handles the rest
 - Do not enable `online_heartbeat` unless you need fast revocation or concurrent-use detection; the default grace period is cheaper and works without a persistent connection
