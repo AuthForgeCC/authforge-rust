@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.0
+
+### Features
+
+- **Self-serve offline activation**: `AuthForgeClient::activate_offline(&self, license_key: &str, path: Option<&Path>) -> Result<(), AuthForgeError>` calls `POST /auth/offline/activate` once and turns a license key into a lifetime, HWID-bound `.authforge` file. The SDK verifies the file with the configured public key(s), app id and local HWID before writing it, writes it atomically to `path` (temp file + rename, parent directories created), and starts an offline session exactly as `login_from_file` does (no background thread). Needs the app secret, unlike air-gapped files. A new machine costs the app owner 2 credits; the same machine re-activating gets the identical file back for free. Refunds and revokes cannot reach files already issued.
+- Fails fast without a request: `InvalidKey` for an empty key, then `InvalidApp` when the app secret, app id or public key is missing. Uses the same HWID, nonce generator and retry policy as `login()`. Errors are only returned, never sent to `on_failure`; on error nothing is written to `path` and the session state is unchanged.
+- New definitive codes in `DEFINITIVE_ERROR_CODES`: the server's `offline_activation_disabled`, `offline_activation_requires_perpetual`, `offline_activation_requires_seats`, `offline_activation_limit_reached`, and the SDK's `offline_file_rejected` (the returned file failed local verification; the verifier's reason is in the message, e.g. `offline_file_rejected: bad_signature`). They arrive as `AuthForgeError::Other(code)`, as `AuthForgeError` is still exhaustive (see `NEXT_MAJOR.md`). A success response without a file is the transient `unexpected_response`; a failed write to `path` is the transient `file_write_failed`.
+- Conformance tests against the shared `self_serve_activation_vectors.json`.
+
 ## 1.4.1
 
 ### Fixes

@@ -1,0 +1,358 @@
+{
+  "format": "authforge-self-serve-activation",
+  "version": 1,
+  "description": "Cross-SDK conformance vectors for POST /auth/offline/activate. Mock the server with each case's response, call activate_offline(licenseKey, path) with the config below, and check expect. Every case must also assert the request (method, path, body fields).",
+  "config": {
+    "appId": "test-app",
+    "appSecret": "test-app-secret",
+    "publicKey": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+    "licenseKey": "TEST-KEY0-0000-0000",
+    "hwid": "testhwid",
+    "note": "Use the SDK's HWID override (or test hook) to make the local HWID equal config.hwid."
+  },
+  "request": {
+    "method": "POST",
+    "path": "/auth/offline/activate",
+    "bodyFields": [
+      "appId",
+      "appSecret",
+      "licenseKey",
+      "hwid",
+      "nonce"
+    ],
+    "note": "Body must carry exactly these fields: appId, appSecret and licenseKey from config, hwid equal to the HWID login() would send, and a fresh nonce from the SDK's existing generator."
+  },
+  "expectations": {
+    "activated": "Return success, write fileWritten byte-for-byte to path (atomically, creating parent directories), and leave the client authenticated with session kind 'offline' and the listed variables, exactly as login_from_file() would. No heartbeat starts.",
+    "error": "Surface errorCode through the SDK's error type, with fatal/transient as listed. Do not write path, do not modify an existing file at path, do not exit the process, and leave the client unauthenticated.",
+    "offline_file_rejected": "SDK-level code for a success response whose file fails local verification. `detail` is the verifier's reason; include it in the error message."
+  },
+  "cases": [
+    {
+      "name": "activated_new_machine",
+      "description": "201: a new file for this machine. Verify, write it, start an offline session.",
+      "response": {
+        "status": 201,
+        "body": {
+          "status": "success",
+          "file": "-----BEGIN AUTHFORGE LICENSE-----\nVersion: 1\nApp-Id: test-app\nLicense: TEST-KEY0-0000-0000\nKey-Id: kid-test-0001\nExpires-At: never\n\neyJ2IjoxLCJ0eXAiOiJhdXRoZm9yZ2UtbGljZW5zZSIsImFwcElkIjoidGVzdC1h\ncHAiLCJsaWNlbnNlS2V5IjoiVEVTVC1LRVkwLTAwMDAtMDAwMCIsImp0aSI6IjAw\nMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDBhMSIsImtpZCI6ImtpZC10\nZXN0LTAwMDEiLCJpc3N1ZWRBdCI6IjIwMjYtMTAtMDlUMTI6MDA6MDAuMDAwWiIs\nImV4cGlyZXNBdCI6bnVsbCwiaHdpZCI6eyJtb2RlIjoiYm91bmQiLCJod2lkcyI6\nWyJ0ZXN0aHdpZCJdfSwibGljZW5zZUV4cGlyZXNBdCI6bnVsbCwibGljZW5zZVZh\ncmlhYmxlcyI6eyJ0aWVyIjoibGlmZXRpbWUifSwiYXBwVmFyaWFibGVzIjp7InRo\nZW1lIjoiZGFyayJ9fQ==\n-----END AUTHFORGE LICENSE-----\n-----BEGIN AUTHFORGE SIGNATURE-----\nDhSH8XlZ/VTgn94AYALsWiny50Z6VOhqjl+qO7PQgGmM8EfpEs2c3z8v6rQKg3XI\nA3dTQ9alHa3aSi6pFBreDg==\n-----END AUTHFORGE SIGNATURE-----\n",
+          "fileName": "TEST-KEY0-0000-0000.authforge",
+          "jti": "00000000-0000-4000-8000-0000000000a1",
+          "replay": false
+        }
+      },
+      "expect": {
+        "outcome": "activated",
+        "writesFile": true,
+        "fileWritten": "-----BEGIN AUTHFORGE LICENSE-----\nVersion: 1\nApp-Id: test-app\nLicense: TEST-KEY0-0000-0000\nKey-Id: kid-test-0001\nExpires-At: never\n\neyJ2IjoxLCJ0eXAiOiJhdXRoZm9yZ2UtbGljZW5zZSIsImFwcElkIjoidGVzdC1h\ncHAiLCJsaWNlbnNlS2V5IjoiVEVTVC1LRVkwLTAwMDAtMDAwMCIsImp0aSI6IjAw\nMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDBhMSIsImtpZCI6ImtpZC10\nZXN0LTAwMDEiLCJpc3N1ZWRBdCI6IjIwMjYtMTAtMDlUMTI6MDA6MDAuMDAwWiIs\nImV4cGlyZXNBdCI6bnVsbCwiaHdpZCI6eyJtb2RlIjoiYm91bmQiLCJod2lkcyI6\nWyJ0ZXN0aHdpZCJdfSwibGljZW5zZUV4cGlyZXNBdCI6bnVsbCwibGljZW5zZVZh\ncmlhYmxlcyI6eyJ0aWVyIjoibGlmZXRpbWUifSwiYXBwVmFyaWFibGVzIjp7InRo\nZW1lIjoiZGFyayJ9fQ==\n-----END AUTHFORGE LICENSE-----\n-----BEGIN AUTHFORGE SIGNATURE-----\nDhSH8XlZ/VTgn94AYALsWiny50Z6VOhqjl+qO7PQgGmM8EfpEs2c3z8v6rQKg3XI\nA3dTQ9alHa3aSi6pFBreDg==\n-----END AUTHFORGE SIGNATURE-----\n",
+        "replay": false,
+        "sessionKind": "offline",
+        "licenseVariables": {
+          "tier": "lifetime"
+        },
+        "appVariables": {
+          "theme": "dark"
+        }
+      }
+    },
+    {
+      "name": "activated_replay",
+      "description": "200: the machine already had a file; the server returns the identical bytes. Same handling as 201.",
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "success",
+          "file": "-----BEGIN AUTHFORGE LICENSE-----\nVersion: 1\nApp-Id: test-app\nLicense: TEST-KEY0-0000-0000\nKey-Id: kid-test-0001\nExpires-At: never\n\neyJ2IjoxLCJ0eXAiOiJhdXRoZm9yZ2UtbGljZW5zZSIsImFwcElkIjoidGVzdC1h\ncHAiLCJsaWNlbnNlS2V5IjoiVEVTVC1LRVkwLTAwMDAtMDAwMCIsImp0aSI6IjAw\nMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDBhMSIsImtpZCI6ImtpZC10\nZXN0LTAwMDEiLCJpc3N1ZWRBdCI6IjIwMjYtMTAtMDlUMTI6MDA6MDAuMDAwWiIs\nImV4cGlyZXNBdCI6bnVsbCwiaHdpZCI6eyJtb2RlIjoiYm91bmQiLCJod2lkcyI6\nWyJ0ZXN0aHdpZCJdfSwibGljZW5zZUV4cGlyZXNBdCI6bnVsbCwibGljZW5zZVZh\ncmlhYmxlcyI6eyJ0aWVyIjoibGlmZXRpbWUifSwiYXBwVmFyaWFibGVzIjp7InRo\nZW1lIjoiZGFyayJ9fQ==\n-----END AUTHFORGE LICENSE-----\n-----BEGIN AUTHFORGE SIGNATURE-----\nDhSH8XlZ/VTgn94AYALsWiny50Z6VOhqjl+qO7PQgGmM8EfpEs2c3z8v6rQKg3XI\nA3dTQ9alHa3aSi6pFBreDg==\n-----END AUTHFORGE SIGNATURE-----\n",
+          "fileName": "TEST-KEY0-0000-0000.authforge",
+          "jti": "00000000-0000-4000-8000-0000000000a1",
+          "replay": true
+        }
+      },
+      "expect": {
+        "outcome": "activated",
+        "writesFile": true,
+        "fileWritten": "-----BEGIN AUTHFORGE LICENSE-----\nVersion: 1\nApp-Id: test-app\nLicense: TEST-KEY0-0000-0000\nKey-Id: kid-test-0001\nExpires-At: never\n\neyJ2IjoxLCJ0eXAiOiJhdXRoZm9yZ2UtbGljZW5zZSIsImFwcElkIjoidGVzdC1h\ncHAiLCJsaWNlbnNlS2V5IjoiVEVTVC1LRVkwLTAwMDAtMDAwMCIsImp0aSI6IjAw\nMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDBhMSIsImtpZCI6ImtpZC10\nZXN0LTAwMDEiLCJpc3N1ZWRBdCI6IjIwMjYtMTAtMDlUMTI6MDA6MDAuMDAwWiIs\nImV4cGlyZXNBdCI6bnVsbCwiaHdpZCI6eyJtb2RlIjoiYm91bmQiLCJod2lkcyI6\nWyJ0ZXN0aHdpZCJdfSwibGljZW5zZUV4cGlyZXNBdCI6bnVsbCwibGljZW5zZVZh\ncmlhYmxlcyI6eyJ0aWVyIjoibGlmZXRpbWUifSwiYXBwVmFyaWFibGVzIjp7InRo\nZW1lIjoiZGFyayJ9fQ==\n-----END AUTHFORGE LICENSE-----\n-----BEGIN AUTHFORGE SIGNATURE-----\nDhSH8XlZ/VTgn94AYALsWiny50Z6VOhqjl+qO7PQgGmM8EfpEs2c3z8v6rQKg3XI\nA3dTQ9alHa3aSi6pFBreDg==\n-----END AUTHFORGE SIGNATURE-----\n",
+        "replay": true,
+        "sessionKind": "offline",
+        "licenseVariables": {
+          "tier": "lifetime"
+        },
+        "appVariables": {
+          "theme": "dark"
+        }
+      }
+    },
+    {
+      "name": "reject_tampered_file",
+      "description": "Signature does not verify. Do not write.",
+      "response": {
+        "status": 201,
+        "body": {
+          "status": "success",
+          "file": "-----BEGIN AUTHFORGE LICENSE-----\nVersion: 1\nApp-Id: test-app\nLicense: TEST-KEY0-0000-0000\nKey-Id: kid-test-0001\nExpires-At: never\n\neyJ2IjoxLCA0eXAiOiJhdXRoZm9yZ2UtbGljZW5zZSIsImFwcElkIjoidGVzdC1h\ncHAiLCJsaWNlbnNlS2V5IjoiVEVTVC1LRVkwLTAwMDAtMDAwMCIsImp0aSI6IjAw\nMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDBhMSIsImtpZCI6ImtpZC10\nZXN0LTAwMDEiLCJpc3N1ZWRBdCI6IjIwMjYtMTAtMDlUMTI6MDA6MDAuMDAwWiIs\nImV4cGlyZXNBdCI6bnVsbCwiaHdpZCI6eyJtb2RlIjoiYm91bmQiLCJod2lkcyI6\nWyJ0ZXN0aHdpZCJdfSwibGljZW5zZUV4cGlyZXNBdCI6bnVsbCwibGljZW5zZVZh\ncmlhYmxlcyI6eyJ0aWVyIjoibGlmZXRpbWUifSwiYXBwVmFyaWFibGVzIjp7InRo\nZW1lIjoiZGFyayJ9fQ==\n-----END AUTHFORGE LICENSE-----\n-----BEGIN AUTHFORGE SIGNATURE-----\nDhSH8XlZ/VTgn94AYALsWiny50Z6VOhqjl+qO7PQgGmM8EfpEs2c3z8v6rQKg3XI\nA3dTQ9alHa3aSi6pFBreDg==\n-----END AUTHFORGE SIGNATURE-----\n",
+          "fileName": "TEST-KEY0-0000-0000.authforge",
+          "jti": "00000000-0000-4000-8000-0000000000a1",
+          "replay": false
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "offline_file_rejected",
+        "fatal": true,
+        "detail": "bad_signature"
+      }
+    },
+    {
+      "name": "reject_wrong_key",
+      "description": "Signed by a key that is not configured. Do not write.",
+      "response": {
+        "status": 201,
+        "body": {
+          "status": "success",
+          "file": "-----BEGIN AUTHFORGE LICENSE-----\nVersion: 1\nApp-Id: test-app\nLicense: TEST-KEY0-0000-0000\nKey-Id: kid-test-0001\nExpires-At: never\n\neyJ2IjoxLCJ0eXAiOiJhdXRoZm9yZ2UtbGljZW5zZSIsImFwcElkIjoidGVzdC1h\ncHAiLCJsaWNlbnNlS2V5IjoiVEVTVC1LRVkwLTAwMDAtMDAwMCIsImp0aSI6IjAw\nMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDBhMSIsImtpZCI6ImtpZC10\nZXN0LTAwMDEiLCJpc3N1ZWRBdCI6IjIwMjYtMTAtMDlUMTI6MDA6MDAuMDAwWiIs\nImV4cGlyZXNBdCI6bnVsbCwiaHdpZCI6eyJtb2RlIjoiYm91bmQiLCJod2lkcyI6\nWyJ0ZXN0aHdpZCJdfSwibGljZW5zZUV4cGlyZXNBdCI6bnVsbCwibGljZW5zZVZh\ncmlhYmxlcyI6eyJ0aWVyIjoibGlmZXRpbWUifSwiYXBwVmFyaWFibGVzIjp7InRo\nZW1lIjoiZGFyayJ9fQ==\n-----END AUTHFORGE LICENSE-----\n-----BEGIN AUTHFORGE SIGNATURE-----\nFzb4jQ1VzHzTrUMUWblaxo3+MWModFTwqPuqGUvRvHEHeWWwNlwlgGyq5n5mVrAA\neweAQzlXPHzE0/4n04spBg==\n-----END AUTHFORGE SIGNATURE-----\n",
+          "fileName": "TEST-KEY0-0000-0000.authforge",
+          "jti": "00000000-0000-4000-8000-0000000000a1",
+          "replay": false
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "offline_file_rejected",
+        "fatal": true,
+        "detail": "bad_signature"
+      }
+    },
+    {
+      "name": "reject_other_hwid",
+      "description": "Valid signature but bound to a different machine. Do not write.",
+      "response": {
+        "status": 201,
+        "body": {
+          "status": "success",
+          "file": "-----BEGIN AUTHFORGE LICENSE-----\nVersion: 1\nApp-Id: test-app\nLicense: TEST-KEY0-0000-0000\nKey-Id: kid-test-0001\nExpires-At: never\n\neyJ2IjoxLCJ0eXAiOiJhdXRoZm9yZ2UtbGljZW5zZSIsImFwcElkIjoidGVzdC1h\ncHAiLCJsaWNlbnNlS2V5IjoiVEVTVC1LRVkwLTAwMDAtMDAwMCIsImp0aSI6IjAw\nMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDBhMSIsImtpZCI6ImtpZC10\nZXN0LTAwMDEiLCJpc3N1ZWRBdCI6IjIwMjYtMTAtMDlUMTI6MDA6MDAuMDAwWiIs\nImV4cGlyZXNBdCI6bnVsbCwiaHdpZCI6eyJtb2RlIjoiYm91bmQiLCJod2lkcyI6\nWyJvdGhlcmh3aWQiXX0sImxpY2Vuc2VFeHBpcmVzQXQiOm51bGwsImxpY2Vuc2VW\nYXJpYWJsZXMiOnsidGllciI6ImxpZmV0aW1lIn0sImFwcFZhcmlhYmxlcyI6eyJ0\naGVtZSI6ImRhcmsifX0=\n-----END AUTHFORGE LICENSE-----\n-----BEGIN AUTHFORGE SIGNATURE-----\nkKSVeCfk8mWEpVDlCeOTjOqmvrElAGLzB3A88acscIYdDZ6fLoKzc2DVo8nqbOC4\nAV841g274LmygkGhpGEwDg==\n-----END AUTHFORGE SIGNATURE-----\n",
+          "fileName": "TEST-KEY0-0000-0000.authforge",
+          "jti": "00000000-0000-4000-8000-0000000000a1",
+          "replay": false
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "offline_file_rejected",
+        "fatal": true,
+        "detail": "hwid_mismatch"
+      }
+    },
+    {
+      "name": "reject_wrong_app",
+      "description": "Valid signature but for another app. Do not write.",
+      "response": {
+        "status": 201,
+        "body": {
+          "status": "success",
+          "file": "-----BEGIN AUTHFORGE LICENSE-----\nVersion: 1\nApp-Id: other-app\nLicense: TEST-KEY0-0000-0000\nKey-Id: kid-test-0001\nExpires-At: never\n\neyJ2IjoxLCJ0eXAiOiJhdXRoZm9yZ2UtbGljZW5zZSIsImFwcElkIjoib3RoZXIt\nYXBwIiwibGljZW5zZUtleSI6IlRFU1QtS0VZMC0wMDAwLTAwMDAiLCJqdGkiOiIw\nMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwYTEiLCJraWQiOiJraWQt\ndGVzdC0wMDAxIiwiaXNzdWVkQXQiOiIyMDI2LTEwLTA5VDEyOjAwOjAwLjAwMFoi\nLCJleHBpcmVzQXQiOm51bGwsImh3aWQiOnsibW9kZSI6ImJvdW5kIiwiaHdpZHMi\nOlsidGVzdGh3aWQiXX0sImxpY2Vuc2VFeHBpcmVzQXQiOm51bGwsImxpY2Vuc2VW\nYXJpYWJsZXMiOnsidGllciI6ImxpZmV0aW1lIn0sImFwcFZhcmlhYmxlcyI6eyJ0\naGVtZSI6ImRhcmsifX0=\n-----END AUTHFORGE LICENSE-----\n-----BEGIN AUTHFORGE SIGNATURE-----\nqnfzIOqaab/rfzoYeTWfwjKkwzM7WsNlqdcpTtGCVOTMotiU1z3t96MYMqCdnGX9\nfsmAV8Ew+yRPycjusbrDAQ==\n-----END AUTHFORGE SIGNATURE-----\n",
+          "fileName": "TEST-KEY0-0000-0000.authforge",
+          "jti": "00000000-0000-4000-8000-0000000000a1",
+          "replay": false
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "offline_file_rejected",
+        "fatal": true,
+        "detail": "wrong_app"
+      }
+    },
+    {
+      "name": "reject_missing_file",
+      "description": "Success status without a file field. Existing malformed-response handling; do not write.",
+      "response": {
+        "status": 201,
+        "body": {
+          "status": "success",
+          "jti": "00000000-0000-4000-8000-0000000000a1",
+          "replay": false
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "unexpected_response",
+        "fatal": false
+      }
+    },
+    {
+      "name": "error_offline_activation_disabled",
+      "description": "The app has not opted in to self-serve activation.",
+      "response": {
+        "status": 403,
+        "body": {
+          "status": "failed",
+          "error": "offline_activation_disabled"
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "offline_activation_disabled",
+        "fatal": true
+      }
+    },
+    {
+      "name": "error_offline_activation_requires_perpetual",
+      "description": "The license has an expiry; only perpetual licenses can self-serve.",
+      "response": {
+        "status": 409,
+        "body": {
+          "status": "failed",
+          "error": "offline_activation_requires_perpetual"
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "offline_activation_requires_perpetual",
+        "fatal": true
+      }
+    },
+    {
+      "name": "error_offline_activation_requires_seats",
+      "description": "Unlimited-seat (shared) licenses cannot self-serve.",
+      "response": {
+        "status": 409,
+        "body": {
+          "status": "failed",
+          "error": "offline_activation_requires_seats"
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "offline_activation_requires_seats",
+        "fatal": true
+      }
+    },
+    {
+      "name": "error_offline_activation_limit_reached",
+      "description": "Every machine slot on the license is used. HWID resets do not free them; the buyer must contact the vendor.",
+      "response": {
+        "status": 403,
+        "body": {
+          "status": "failed",
+          "error": "offline_activation_limit_reached"
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "offline_activation_limit_reached",
+        "fatal": true
+      }
+    },
+    {
+      "name": "error_hwid_mismatch",
+      "description": "No free seat for this machine.",
+      "response": {
+        "status": 403,
+        "body": {
+          "status": "failed",
+          "error": "hwid_mismatch"
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "hwid_mismatch",
+        "fatal": true
+      }
+    },
+    {
+      "name": "error_revoked",
+      "description": "Existing code, existing classification.",
+      "response": {
+        "status": 410,
+        "body": {
+          "status": "failed",
+          "error": "revoked"
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "revoked",
+        "fatal": true
+      }
+    },
+    {
+      "name": "error_invalid_key",
+      "description": "Existing code, existing classification (transient in every SDK today).",
+      "response": {
+        "status": 401,
+        "body": {
+          "status": "failed",
+          "error": "invalid_key"
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "invalid_key",
+        "fatal": false
+      }
+    },
+    {
+      "name": "error_no_credits",
+      "description": "The app owner is out of credits. Existing code, existing classification.",
+      "response": {
+        "status": 429,
+        "body": {
+          "status": "failed",
+          "error": "no_credits"
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "no_credits",
+        "fatal": false
+      }
+    },
+    {
+      "name": "error_rate_limited",
+      "description": "Existing code. The SDK may retry exactly as login() does for rate_limited; a server that keeps answering this ends in this error.",
+      "response": {
+        "status": 429,
+        "body": {
+          "status": "failed",
+          "error": "rate_limited"
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "rate_limited",
+        "fatal": false
+      }
+    },
+    {
+      "name": "error_system_error",
+      "description": "Existing code, existing classification.",
+      "response": {
+        "status": 500,
+        "body": {
+          "status": "failed",
+          "error": "system_error"
+        }
+      },
+      "expect": {
+        "outcome": "error",
+        "writesFile": false,
+        "errorCode": "system_error",
+        "fatal": false
+      }
+    }
+  ]
+}

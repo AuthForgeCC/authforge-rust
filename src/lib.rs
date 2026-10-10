@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -42,8 +43,8 @@ pub enum HeartbeatMode {
 pub struct AuthForgeConfig {
     pub app_id: String,
     /// Application secret. Required for online APIs (`login`, `validate_license`,
-    /// `self_ban`). Leave empty for offline-only clients (`login_from_file`);
-    /// air-gapped builds should not ship the secret.
+    /// `self_ban`, `activate_offline`). Leave empty for offline-only clients
+    /// (`login_from_file`); air-gapped builds should not ship the secret.
     pub app_secret: String,
     /// Trusted Ed25519 public key in base64. Use `public_keys` instead for
     /// rotation set support; `public_key` remains for the single-key
@@ -155,9 +156,10 @@ pub enum AuthForgeError {
 
 impl AuthForgeError {
     /// Machine-readable code: the server's error code (`"revoked"`,
-    /// `"hwid_mismatch"`, ...; `malformed_request` and unknown codes arrive
-    /// as `Other(code)`) or an SDK code (`"network_error"`, `"timeout"`,
-    /// `"http_error_502"`, `"unexpected_response"`, ...).
+    /// `"hwid_mismatch"`, ...; `malformed_request`, the `offline_activation_*`
+    /// codes and unknown codes arrive as `Other(code)`) or an SDK code
+    /// (`"network_error"`, `"timeout"`, `"http_error_502"`,
+    /// `"unexpected_response"`, `"offline_file_rejected"`, ...).
     pub fn code(&self) -> &str {
         match self {
             Self::InvalidApp => "invalid_app",
@@ -229,7 +231,13 @@ pub const DEFINITIVE_ERROR_CODES: &[&str] = &[
     "malformed_request",
     "app_disabled",
     "invalid_app",
-    "signature_mismatch"
+    "signature_mismatch",
+    // Self-serve offline activation (`activate_offline`).
+    "offline_activation_disabled",
+    "offline_activation_requires_perpetual",
+    "offline_activation_requires_seats",
+    "offline_activation_limit_reached",
+    "offline_file_rejected"
 ];
 
 /// Classifies an [`AuthForgeError::code`] value: `false` for the codes in
@@ -362,7 +370,12 @@ struct SignedResponse {
     status: Value,
     payload: Option<String>,
     signature: Option<String>,
-    error: Option<String>
+    error: Option<String>,
+    /// `/auth/offline/activate` only: the armored `.authforge` file and
+    /// whether this machine already had it. Kept as raw JSON so an odd value
+    /// never breaks parsing of the other endpoints' responses.
+    file: Option<Value>,
+    replay: Option<Value>
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -393,6 +406,17 @@ struct ValidateRequest<'a> {
     nonce: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     ttl_seconds: Option<u64>
+}
+
+/// Body of `POST /auth/offline/activate`: exactly these five fields.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfflineActivateRequest<'a> {
+    app_id: &'a str,
+    app_secret: &'a str,
+    license_key: &'a str,
+    hwid: &'a str,
+    nonce: &'a str
 }
 
 #[derive(Deserialize, Serialize)]
@@ -801,6 +825,92 @@ impl AuthForgeClient {
             .and_then(|state| state.offline_license.clone())
     }
 
+    /// Self-serve offline activation: turn a license key into a lifetime,
+    /// HWID-bound `.authforge` file with ONE online call
+    /// (`POST /auth/offline/activate`), then run from the file with no network.
+    ///
+    /// Needs the app secret (unlike air-gapped builds) and the app's
+    /// self-serve opt-in. A new machine costs the app owner 2 credits; the
+    /// same machine activating again gets the identical file back for free.
+    ///
+    /// The returned file is verified locally (signature against the
+    /// configured public key(s), app id, this machine's HWID) before anything
+    /// is written. With `path`, the file is then written byte-for-byte and
+    /// atomically (temp file + rename), creating parent directories. On
+    /// success the client is authenticated exactly as after
+    /// [`Self::login_from_file`]: [`SessionKind::Offline`], variables,
+    /// [`Self::get_offline_license`], no background checks.
+    ///
+    /// Errors are [`AuthForgeError`], returned only (`on_failure` is never
+    /// called): `InvalidKey` for an empty key, then `InvalidApp` when the app
+    /// id, app secret or public key is missing, both without a request; the
+    /// server's code otherwise (`offline_activation_disabled`,
+    /// `offline_activation_requires_perpetual`,
+    /// `offline_activation_requires_seats`, `offline_activation_limit_reached`
+    /// arrive as `Other(code)` and are fatal; `hwid_mismatch` here means no
+    /// free seat); `offline_file_rejected: <reason>` when the returned file
+    /// fails verification; `unexpected_response` for a success without a
+    /// file; `file_write_failed` (transient) when `path` cannot be written.
+    /// On any error nothing is written to `path` and session state is left
+    /// as it was: an existing session is not logged out, and a client that
+    /// was not authenticated stays unauthenticated.
+    pub fn activate_offline(&self, license_key: &str, path: Option<&Path>) -> Result<(), AuthForgeError> {
+        self.activate_offline_inner(license_key, path).map(|_replay| ())
+    }
+
+    /// [`Self::activate_offline`], returning the server's `replay` flag.
+    fn activate_offline_inner(&self, license_key: &str, path: Option<&Path>) -> Result<bool, AuthForgeError> {
+        // Same fail-fast order in every SDK: license key, then app secret.
+        if license_key.trim().is_empty() {
+            return Err(AuthForgeError::InvalidKey);
+        }
+        if self.inner.cfg.app_id.trim().is_empty()
+            || self.inner.cfg.app_secret.trim().is_empty()
+            || self.inner.cfg.public_keys.is_empty()
+        {
+            return Err(AuthForgeError::InvalidApp);
+        }
+
+        let nonce = generate_nonce();
+        let request = OfflineActivateRequest {
+            app_id: &self.inner.cfg.app_id,
+            app_secret: &self.inner.cfg.app_secret,
+            license_key,
+            hwid: &self.inner.hwid,
+            nonce: &nonce
+        };
+        // Errors are reported only through the return value: no `on_failure`,
+        // not even for network failures.
+        let (response, _) = self.post_json(
+            "/auth/offline/activate",
+            &request,
+            false,
+            self.inner.cfg.request_timeout
+        )?;
+        if !is_success_status(&response.status) {
+            return Err(server_verdict_error(response.error));
+        }
+        let file = response
+            .file
+            .as_ref()
+            .and_then(Value::as_str)
+            .filter(|file| !file.trim().is_empty())
+            .ok_or_else(|| AuthForgeError::Other("unexpected_response: success without a file".to_string()))?;
+
+        // The file is the signed artifact; check it before writing anything.
+        // The verifier's reason goes in the message only: its `hwid_mismatch`
+        // must not be confused with the server's (no free seat).
+        let lic = self
+            .verify_license_file_text(file, None)
+            .map_err(|err| AuthForgeError::Other(format!("offline_file_rejected: {}", err.code())))?;
+        if let Some(path) = path {
+            offline::write_file_atomic(path, file.as_bytes())
+                .map_err(|err| AuthForgeError::Other(format!("file_write_failed: {err}")))?;
+        }
+        self.apply_offline_license(&lic);
+        Ok(response.replay.as_ref().and_then(Value::as_bool).unwrap_or(false))
+    }
+
     fn verify_license_file_text(
         &self,
         text: &str,
@@ -1078,12 +1188,7 @@ impl AuthForgeClient {
         context: SigningContext
     ) -> Result<SignedPayload, AuthForgeError> {
         if !is_success_status(&response.status) {
-            let server_error = response
-                .error
-                .map(|code| code.trim().to_ascii_lowercase())
-                .filter(|code| !code.is_empty())
-                .unwrap_or_else(|| "unknown_error".to_string());
-            return Err(map_server_error(&server_error));
+            return Err(server_verdict_error(response.error));
         }
 
         let payload_b64 = response
@@ -1324,7 +1429,8 @@ mod mock_http {
     /// Reads the whole request, headers plus `Content-Length` body. Closing a
     /// socket with unread request bytes resets the connection on Windows, and
     /// the client reports that as a network error.
-    pub(crate) fn read_request(stream: &mut TcpStream) {
+    /// Returns the raw request bytes for tests that inspect them.
+    pub(crate) fn read_request(stream: &mut TcpStream) -> Vec<u8> {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let mut data = Vec::new();
         let mut buf = [0u8; 4096];
@@ -1337,11 +1443,11 @@ mod mock_http {
                     .and_then(|value| value.trim().parse::<usize>().ok())
                     .unwrap_or(0);
                 if data.len() >= end + 4 + length {
-                    return;
+                    return data;
                 }
             }
             match stream.read(&mut buf) {
-                Ok(0) | Err(_) => return,
+                Ok(0) | Err(_) => return data,
                 Ok(read) => data.extend_from_slice(&buf[..read])
             }
         }
@@ -1355,6 +1461,9 @@ mod mock_http {
         let _ = stream.write_all(response.as_bytes());
     }
 }
+
+#[cfg(test)]
+mod self_serve_activation_tests;
 
 #[cfg(test)]
 mod validate_license_tests {
@@ -2273,6 +2382,16 @@ fn heartbeat_failure_error(response: &SignedResponse) -> AuthForgeError {
             Value::from(response.error.clone())
         ))
     }
+}
+
+/// The error for a failed `/auth/validate` or `/auth/offline/activate`
+/// response: the normalized server code, or `unknown_error` without one.
+fn server_verdict_error(error: Option<String>) -> AuthForgeError {
+    let code = error
+        .map(|code| code.trim().to_ascii_lowercase())
+        .filter(|code| !code.is_empty())
+        .unwrap_or_else(|| "unknown_error".to_string());
+    map_server_error(&code)
 }
 
 fn map_server_error(error: &str) -> AuthForgeError {

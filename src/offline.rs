@@ -28,7 +28,12 @@
 //! joined, whitespace removed) - the same contract as `/auth/validate`.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
+use std::fs;
+use std::io::{self, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD;
@@ -373,6 +378,49 @@ pub(crate) fn epoch_now_ms() -> i64 {
 
 pub(crate) fn contains_armor(text: &str) -> bool {
     text.contains(BEGIN_LICENSE)
+}
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Write `bytes` to `path` atomically for `activate_offline`: a temp file in
+/// the same directory, flushed to disk, then renamed over `path` (which
+/// replaces an existing file on every platform std supports). Parent
+/// directories are created. On failure the temp file is removed and `path`
+/// is left as it was.
+pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+    if let Some(dir) = dir {
+        fs::create_dir_all(dir)?;
+    }
+
+    let mut temp_name = OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temp_path = match dir {
+        Some(dir) => dir.join(&temp_name),
+        None => temp_name.into()
+    };
+
+    let result = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&temp_path, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 /// Parse `YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]` into epoch milliseconds
