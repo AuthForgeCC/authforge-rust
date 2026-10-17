@@ -1,0 +1,172 @@
+{
+  "version": 2,
+  "prefix": "authforge-hwid-v2|",
+  "hwid": [
+    {
+      "name": "macos_platform_uuid",
+      "appId": "test-app",
+      "machineId": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      "hwid": "ca0fdd297c53bfd925b840e41e886e684c5b3fa3e6a3dc42516547576f1a453c"
+    },
+    {
+      "name": "linux_machine_id",
+      "appId": "test-app",
+      "machineId": "4c4c4544003957108052b4c04f384833",
+      "hwid": "2d4413975da995660f01d851e6c5fc2179ad554ef7b9fd5d0c9a9e58b253d79a"
+    },
+    {
+      "name": "windows_machine_guid",
+      "appId": "test-app",
+      "machineId": "6f2c3c4e-9a7b-4b1e-8f7e-2d3c4b5a6f70",
+      "hwid": "310c3c2433c77dba05acbff63cda71bfbe2476c9d85826c250ea615665e31aae"
+    },
+    {
+      "name": "same_machine_other_app",
+      "appId": "other-app",
+      "machineId": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      "hwid": "e0ea3ccb4a2c57116b35bbf46de26a3ad461d3579dada60119ac22034def39a1"
+    },
+    {
+      "name": "legacy_fallback",
+      "appId": "test-app",
+      "machineId": "legacy:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "hwid": "560b6e173a82d33ca7d5a16782fe7e70613483a081f874c2e29ea2726961ac27"
+    }
+  ],
+  "normalize": [
+    {
+      "name": "uppercase_uuid",
+      "raw": "3F2504E0-4F89-11D3-9A0C-0305E82C3301",
+      "expect": "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+    },
+    {
+      "name": "trailing_newline",
+      "raw": "4c4c4544003957108052b4c04f384833\n",
+      "expect": "4c4c4544003957108052b4c04f384833"
+    },
+    {
+      "name": "crlf_and_spaces",
+      "raw": "  ABCDEF0123456789\r\n",
+      "expect": "abcdef0123456789"
+    },
+    {
+      "name": "tabs",
+      "raw": "\tabcdef0123456789\t",
+      "expect": "abcdef0123456789"
+    },
+    {
+      "name": "min_length",
+      "raw": "12345678",
+      "expect": "12345678"
+    },
+    {
+      "name": "max_length",
+      "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "too_long",
+      "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": null
+    },
+    {
+      "name": "too_short",
+      "raw": "abc1234",
+      "expect": null
+    },
+    {
+      "name": "empty",
+      "raw": "",
+      "expect": null
+    },
+    {
+      "name": "whitespace_only",
+      "raw": "  \n",
+      "expect": null
+    },
+    {
+      "name": "systemd_uninitialized",
+      "raw": "uninitialized\n",
+      "expect": null
+    },
+    {
+      "name": "all_zero_uuid",
+      "raw": "00000000-0000-0000-0000-000000000000",
+      "expect": null
+    },
+    {
+      "name": "all_zero_machine_id",
+      "raw": "00000000000000000000000000000000\n",
+      "expect": null
+    },
+    {
+      "name": "non_hex",
+      "raw": "zzzzzzzzzzzz",
+      "expect": null
+    },
+    {
+      "name": "inner_space",
+      "raw": "abcd ef0123456789",
+      "expect": null
+    }
+  ],
+  "ioreg": [
+    {
+      "name": "real_output",
+      "output": "+-o J316sAP  <class IOPlatformExpertDevice, id 0x100000215, registered, matched, active, busy 0 (2104 ms), retain 39>\n    {\n      \"IOPolledInterface\" = \"AppleARMWatchdogTimerHibernateHandler is not serializable\"\n      \"compatible\" = <\"J316sAP\",\"MacBookPro18,1\",\"AppleARM\">\n      \"IOPlatformSerialNumber\" = \"C02XXXXXXXXX\"\n      \"model\" = <\"MacBookPro18,1\">\n      \"IOPlatformUUID\" = \"3F2504E0-4F89-11D3-9A0C-0305E82C3301\"\n      \"manufacturer\" = <\"Apple Inc.\">\n    }\n",
+      "expect": "3F2504E0-4F89-11D3-9A0C-0305E82C3301"
+    },
+    {
+      "name": "no_spaces",
+      "output": "\"IOPlatformUUID\"=\"3F2504E0-4F89-11D3-9A0C-0305E82C3301\"",
+      "expect": "3F2504E0-4F89-11D3-9A0C-0305E82C3301"
+    },
+    {
+      "name": "missing",
+      "output": "+-o Root  <class IORegistryEntry>\n    {\n      \"IOKitBuildVersion\" = \"Darwin\"\n    }\n",
+      "expect": null
+    },
+    {
+      "name": "empty",
+      "output": "",
+      "expect": null
+    }
+  ],
+  "regQuery": [
+    {
+      "name": "real_output_crlf",
+      "output": "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography\r\n    MachineGuid    REG_SZ    6f2c3c4e-9a7b-4b1e-8f7e-2d3c4b5a6f70\r\n\r\n",
+      "expect": "6f2c3c4e-9a7b-4b1e-8f7e-2d3c4b5a6f70"
+    },
+    {
+      "name": "tabs_lf",
+      "output": "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography\n\tMachineGuid\tREG_SZ\t6f2c3c4e-9a7b-4b1e-8f7e-2d3c4b5a6f70\n",
+      "expect": "6f2c3c4e-9a7b-4b1e-8f7e-2d3c4b5a6f70"
+    },
+    {
+      "name": "lowercase_name",
+      "output": "    machineguid    REG_SZ    6f2c3c4e-9a7b-4b1e-8f7e-2d3c4b5a6f70\r\n",
+      "expect": "6f2c3c4e-9a7b-4b1e-8f7e-2d3c4b5a6f70"
+    },
+    {
+      "name": "wrong_type",
+      "output": "    MachineGuid    REG_DWORD    0x1\r\n",
+      "expect": null
+    },
+    {
+      "name": "other_value",
+      "output": "    MachineGuidBackup    REG_SZ    6f2c3c4e-9a7b-4b1e-8f7e-2d3c4b5a6f70\r\n",
+      "expect": null
+    },
+    {
+      "name": "error_output",
+      "output": "ERROR: The system was unable to find the specified registry key or value.\r\n",
+      "expect": null
+    },
+    {
+      "name": "empty",
+      "output": "",
+      "expect": null
+    }
+  ]
+}

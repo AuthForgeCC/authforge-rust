@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.0.0 (unreleased)
+
+### Breaking
+
+- **HWID v2: the HWID is derived from the OS machine id.** `sha256("authforge-hwid-v2|" + app_id + "|" + machine_id)` as lowercase hex, where `machine_id` is the trimmed, lowercased OS id: macOS `IOPlatformUUID` (from `/usr/sbin/ioreg`), Linux `/etc/machine-id` then `/var/lib/dbus/machine-id`, Windows `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` (64-bit view, via `reg.exe /reg:64`, hidden window). Each source has a 2 s timeout and any failure moves on silently. The previous hostname + OS + MAC fingerprint changed whenever the first network interface or the hostname changed (macOS rotates private Wi-Fi addresses per network); it is kept unchanged only as a fallback, as `legacy:<old fingerprint>`, when no valid OS id can be read.
+- **Every bound HWID changes once on upgrade.** Online, a device rebinds into a free HWID slot, or the license needs an HWID reset. Offline `.authforge` files bound to a pre-2.0 HWID fail with `HwidMismatch` and must be re-issued (collect the new HWID with `create_activation_request`).
+- HWIDs are now identical across all AuthForge SDKs for the same app id and machine, and different between apps on the same machine. Containers without a unique `/etc/machine-id` should set `hwid_override`.
+- `hwid_override` behaves as before. No new crate dependencies.
+
+### Tests
+
+- Conformance tests against the shared `hwid_vectors.json` (derivation, normalization, `ioreg` and `reg query` parsing), plus a live check on macOS that `hwid()` matches the real `IOPlatformUUID`.
+
 ## 1.5.0
 
 ### Features

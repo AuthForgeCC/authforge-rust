@@ -418,7 +418,7 @@ fn a_failed_activation_keeps_an_existing_session() {
 
 #[test]
 fn activation_sends_the_same_hwid_as_login() {
-    // Generated fingerprint, no override: both requests must carry it.
+    // Generated HWID, no override: both requests must carry it.
     let server = MockServer::start(
         401,
         r#"{"status":"failed","error":"invalid_key"}"#.to_string(),

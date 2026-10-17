@@ -473,6 +473,7 @@ impl AuthForgeClient {
         #[allow(deprecated)]
         let online_heartbeat =
             config.online_heartbeat || matches!(config.heartbeat_mode, HeartbeatMode::Server);
+        let hwid = resolve_hwid(&config.app_id, config.hwid_override);
         let runtime_cfg = RuntimeConfig {
             app_id: config.app_id,
             app_secret: config.app_secret,
@@ -506,7 +507,7 @@ impl AuthForgeClient {
 
         let inner = ClientInner {
             cfg: runtime_cfg,
-            hwid: resolve_hwid(config.hwid_override),
+            hwid,
             state: Arc::new(Mutex::new(SessionState {
                 authenticated: false,
                 session_kind: None,
@@ -2446,7 +2447,165 @@ fn read_license_file_input(path_or_text: &str) -> Result<String, OfflineLicenseE
     std::fs::read_to_string(path_or_text).map_err(|err| OfflineLicenseError::ReadError(err.to_string()))
 }
 
-fn generate_hwid() -> String {
+// HWID v2: sha256("authforge-hwid-v2|" + app_id + "|" + machine_id), where machine_id is
+// the OS machine id (macOS IOPlatformUUID, Linux /etc/machine-id, Windows MachineGuid).
+// Every SDK derives the same value; conformance is pinned by hwid_vectors.json.
+const HWID_V2_PREFIX: &str = "authforge-hwid-v2|";
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const MACHINE_ID_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const LINUX_MACHINE_ID_PATHS: [&str; 2] = ["/etc/machine-id", "/var/lib/dbus/machine-id"];
+
+/// Derive the HWID from an already-normalized machine id (or a `legacy:` fallback id).
+fn hwid_from_machine_id(app_id: &str, machine_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(HWID_V2_PREFIX.as_bytes());
+    hasher.update(app_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(machine_id.as_bytes());
+    hex_lower(&hasher.finalize())
+}
+
+/// Trim and lowercase an OS machine id; `None` when it is not a usable id.
+fn normalize_machine_id(raw: &str) -> Option<String> {
+    let value = raw
+        .trim_matches([' ', '\t', '\r', '\n'])
+        .to_ascii_lowercase();
+    if value.len() < 8 || value.len() > 128 {
+        return None;
+    }
+    if !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-') {
+        return None;
+    }
+    if value.bytes().all(|b| b == b'0' || b == b'-') {
+        return None;
+    }
+    Some(value)
+}
+
+/// Extract IOPlatformUUID from `ioreg -rd1 -c IOPlatformExpertDevice` output.
+/// Same semantics as the regex `"IOPlatformUUID"\s*=\s*"([^"]+)"` (first match).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_ioreg_platform_uuid(output: &str) -> Option<String> {
+    const KEY: &str = "\"IOPlatformUUID\"";
+    // Regex `\s` (JS/Python/RE2) covers ASCII whitespace plus Unicode spaces;
+    // char::is_whitespace is the Rust equivalent.
+    let mut search_from = 0;
+    while let Some(pos) = output[search_from..].find(KEY) {
+        let after_key = search_from + pos + KEY.len();
+        search_from = search_from + pos + 1;
+        let rest = output[after_key..].trim_start_matches(char::is_whitespace);
+        let Some(rest) = rest.strip_prefix('=') else { continue };
+        let rest = rest.trim_start_matches(char::is_whitespace);
+        let Some(rest) = rest.strip_prefix('"') else { continue };
+        let Some(end) = rest.find('"') else { continue };
+        if end == 0 {
+            continue;
+        }
+        return Some(rest[..end].to_string());
+    }
+    None
+}
+
+/// Extract MachineGuid from `reg.exe query ... /v MachineGuid` output.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_reg_query_machine_guid(output: &str) -> Option<String> {
+    for line in output.split('\n') {
+        let tokens: Vec<&str> = line
+            .split([' ', '\t', '\r', '\n'])
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tokens.len() >= 3 && tokens[0].eq_ignore_ascii_case("MachineGuid") && tokens[1] == "REG_SZ" {
+            return Some(tokens[2].to_string());
+        }
+    }
+    None
+}
+
+/// Run a command with stdout captured, stderr/stdin discarded, and a hard timeout.
+/// Any failure (spawn error, timeout, non-zero exit, non-UTF-8 output) is `None`.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn run_machine_id_command(mut command: std::process::Command) -> Option<String> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    // Drain stdout on a thread so a large output cannot block the child on a full pipe.
+    let mut stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + MACHINE_ID_COMMAND_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let output = reader.join().ok()?;
+    if !status?.success() {
+        return None;
+    }
+    String::from_utf8(output).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn read_os_machine_id() -> Option<String> {
+    let mut command = std::process::Command::new("/usr/sbin/ioreg");
+    command.args(["-rd1", "-c", "IOPlatformExpertDevice"]);
+    let output = run_machine_id_command(command)?;
+    normalize_machine_id(&parse_ioreg_platform_uuid(&output)?)
+}
+
+#[cfg(target_os = "linux")]
+fn read_os_machine_id() -> Option<String> {
+    LINUX_MACHINE_ID_PATHS.iter().find_map(|path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| normalize_machine_id(&raw))
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn read_os_machine_id() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let system_root = std::env::var("SystemRoot")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "C:\\Windows".to_string());
+    let reg_exe = std::path::PathBuf::from(system_root).join("System32").join("reg.exe");
+    let mut command = std::process::Command::new(reg_exe);
+    command
+        .args([
+            "query",
+            "HKLM\\SOFTWARE\\Microsoft\\Cryptography",
+            "/v",
+            "MachineGuid",
+            "/reg:64",
+        ])
+        .creation_flags(CREATE_NO_WINDOW);
+    let output = run_machine_id_command(command)?;
+    normalize_machine_id(&parse_reg_query_machine_guid(&output)?)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn read_os_machine_id() -> Option<String> {
+    None
+}
+
+/// Pre-2.0 fingerprint, kept only as the fallback when no OS machine id is readable.
+/// Its output must not change.
+fn legacy_fingerprint() -> String {
     let host = hostname::get()
         .ok()
         .and_then(|name| name.into_string().ok())
@@ -2464,14 +2623,132 @@ fn generate_hwid() -> String {
     hex_lower(&hasher.finalize())
 }
 
-fn resolve_hwid(hwid_override: Option<String>) -> String {
+fn generate_hwid(app_id: &str) -> String {
+    let machine_id = read_os_machine_id().unwrap_or_else(|| format!("legacy:{}", legacy_fingerprint()));
+    hwid_from_machine_id(app_id, &machine_id)
+}
+
+fn resolve_hwid(app_id: &str, hwid_override: Option<String>) -> String {
     if let Some(value) = hwid_override {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
         }
     }
-    generate_hwid()
+    generate_hwid(app_id)
+}
+
+#[cfg(test)]
+mod hwid_tests {
+    use super::*;
+
+    fn vectors() -> Value {
+        serde_json::from_str(include_str!("../hwid_vectors.json")).expect("hwid vectors")
+    }
+
+    fn cases<'a>(v: &'a Value, key: &str) -> &'a Vec<Value> {
+        let arr = v[key].as_array().expect("vector array");
+        assert!(!arr.is_empty(), "{key} vectors empty");
+        arr
+    }
+
+    fn expect_opt(case: &Value) -> Option<String> {
+        case["expect"].as_str().map(str::to_string)
+    }
+
+    #[test]
+    fn vectors_header() {
+        let v = vectors();
+        assert_eq!(v["version"].as_u64(), Some(2));
+        assert_eq!(v["prefix"].as_str(), Some(HWID_V2_PREFIX));
+    }
+
+    #[test]
+    fn hwid_vectors() {
+        let v = vectors();
+        for case in cases(&v, "hwid") {
+            let got = hwid_from_machine_id(
+                case["appId"].as_str().unwrap(),
+                case["machineId"].as_str().unwrap()
+            );
+            assert_eq!(got, case["hwid"].as_str().unwrap(), "hwid case {}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn normalize_vectors() {
+        let v = vectors();
+        for case in cases(&v, "normalize") {
+            let got = normalize_machine_id(case["raw"].as_str().unwrap());
+            assert_eq!(got, expect_opt(case), "normalize case {}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn ioreg_vectors() {
+        let v = vectors();
+        for case in cases(&v, "ioreg") {
+            let got = parse_ioreg_platform_uuid(case["output"].as_str().unwrap());
+            assert_eq!(got, expect_opt(case), "ioreg case {}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn reg_query_vectors() {
+        let v = vectors();
+        for case in cases(&v, "regQuery") {
+            let got = parse_reg_query_machine_guid(case["output"].as_str().unwrap());
+            assert_eq!(got, expect_opt(case), "regQuery case {}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn ioreg_parser_skips_non_matching_occurrences() {
+        // Regex semantics: an earlier `"IOPlatformUUID"` that is not followed by
+        // `= "value"` does not stop the search.
+        let out = "\"IOPlatformUUID\" <x>\n\"IOPlatformUUID\" = \"\"\n\"IOPlatformUUID\" =\t\"ABC12345\"";
+        assert_eq!(parse_ioreg_platform_uuid(out).as_deref(), Some("ABC12345"));
+        assert_eq!(parse_ioreg_platform_uuid("\"IOPlatformUUID\" = \"unterminated"), None);
+    }
+
+    #[test]
+    fn override_is_used_verbatim_after_trim() {
+        assert_eq!(resolve_hwid("app", Some("  my-hwid \n".into())), "my-hwid");
+        assert_eq!(resolve_hwid("app", Some("   ".into())), generate_hwid("app"));
+    }
+
+    #[test]
+    fn hwid_is_app_scoped_and_stable() {
+        let a = generate_hwid("app-a");
+        assert_eq!(a, generate_hwid("app-a"));
+        assert_ne!(a, generate_hwid("app-b"));
+        assert_eq!(a.len(), 64);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_macos_hwid_matches_ioreg() {
+        let output = std::process::Command::new("/usr/sbin/ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output()
+            .expect("run ioreg");
+        let raw = parse_ioreg_platform_uuid(&String::from_utf8_lossy(&output.stdout)).expect("IOPlatformUUID");
+        let machine_id = normalize_machine_id(&raw).expect("valid IOPlatformUUID");
+        let expected = hwid_from_machine_id("live-test-app", &machine_id);
+
+        let make = || {
+            AuthForgeClient::new(AuthForgeConfig {
+                app_id: "live-test-app".into(),
+                app_secret: "secret".into(),
+                public_key: "".into(),
+                ..AuthForgeConfig::default()
+            })
+        };
+        let first = make();
+        let second = make();
+        assert_eq!(first.hwid(), second.hwid());
+        assert_eq!(first.hwid(), expected);
+    }
 }
 
 fn build_agent(timeout_secs: u64) -> Agent {

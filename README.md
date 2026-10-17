@@ -16,7 +16,7 @@ Everything in this list ships in `src/lib.rs` today:
 - **Ed25519 signature verification** on every `/auth/validate` and `/auth/heartbeat` response; tampered or unsigned responses are rejected. `verify_payload_signature_ed25519[_any]` is exported for standalone use.
 - **Key rotation**: configure `public_key` (single key or comma-separated string) and/or `public_keys` (rotation set). The SDK trusts a signature that matches **any** configured key, so you can roll the server-side signing key without breaking deployed clients.
 - **Nonce anti-replay**: a fresh nonce is sent on every request and the echoed nonce in the signed payload is checked; a mismatch returns `ReplayDetected`.
-- **HWID fingerprinting**: deterministic device hash from hostname + OS + MAC, with graceful fallback.
+- **HWID**: derived from the OS machine id (macOS `IOPlatformUUID`, Linux `/etc/machine-id`, Windows `MachineGuid`), identical across all AuthForge SDKs for the same app and machine. See [Hardware ID](#hardware-id).
 - **`hwid_override`**: bind to any identity instead of the machine (for example `tg:<id>`, `discord:<id>`).
 - **Seat enforcement**: the server binds each HWID into a license's free slots up to `max_hwid_slots`; `hwid_count` / `max_hwid_slots` are surfaced on `LoginResult`. A shared (unlimited-seat) key skips per-device binding.
 - **Grace period by default, opt-in online check-ins** (see [Grace period and online check-ins](#grace-period-and-online-check-ins)).
@@ -123,7 +123,7 @@ To enable online check-ins instead, add `online_heartbeat: true` (and optionally
 | `request_timeout` | `u64` | `15` | Request timeout in seconds |
 | `heartbeat_request_timeout` | `Option<u64>` | `None` (8 seconds) | HTTP timeout in seconds for `/auth/heartbeat` only. Keep it below `request_timeout` so a stuck check-in doesn't hold up `logout()` |
 | `session_ttl_seconds` | `Option<u64>` | `None` (server default: 86400) | Requested grace period duration in seconds. Server clamps to `[3600, 604800]` (1h to 7d); preserved across check-in refreshes. |
-| `hwid_override` | `Option<String>` | `None` | Optional custom hardware/subject identifier. When set to `Some(non-empty)`, the SDK uses it instead of generated device fingerprint data. |
+| `hwid_override` | `Option<String>` | `None` | Optional custom hardware/subject identifier. When set to `Some(non-empty)`, the SDK sends it verbatim instead of deriving the HWID from the OS machine id. |
 
 ### Identity-based binding example (Telegram/Discord)
 
@@ -245,7 +245,7 @@ match client.login_from_file("license.authforge") {
 }
 ```
 
-Collect the HWID from the same SDK build that will load the file: fingerprints are not portable across SDKs or languages. After `login_from_file`, `get_session_kind()` returns `Some(SessionKind::Offline)` (`Some(SessionKind::Online)` after `login`, `None` when logged out).
+Since 2.0 every AuthForge SDK derives the same HWID for the same app and machine, so the HWID can come from any SDK build of the same app (the exception is the legacy fallback on machines without an OS machine id; see [Hardware ID](#hardware-id)). HWIDs collected before 2.0 no longer match. After `login_from_file`, `get_session_kind()` returns `Some(SessionKind::Offline)` (`Some(SessionKind::Online)` after `login`, `None` when logged out).
 
 `authforge::verify_license_file(text, &opts)` (crate function) and `client.verify_license_file(path_or_text)` perform the same checks without touching client state. Errors are the `OfflineLicenseError` enum, in check order: `BadArmor`, `BadSignature`, `UnsupportedVersion`, `MalformedPayload`, `WrongApp`, `Expired`, `HwidMismatch` (plus `ReadError` when a path cannot be read); `.code()` gives the cross-SDK string. `login_from_file` also reports `offline_login_failed: <code>` through `on_failure`. The `AuthForgeError` enum used by the online APIs is unchanged.
 
@@ -318,6 +318,26 @@ Billing and limits:
 - **A new machine costs 2 credits**, charged to the app owner once. A refused activation costs nothing.
 - **The same machine activating again is free**: the server returns the identical file (lost file, reinstall, double click).
 - **Refunds, chargebacks and revokes cannot reach issued files.** They revoke the license online, but a lifetime file already on a machine keeps working.
+
+## Hardware ID
+
+The HWID (v2, since 2.0) is
+
+`SHA256("authforge-hwid-v2|" + app_id + "|" + machine_id)` as lowercase hex,
+
+where `machine_id` is the operating system's own machine id, trimmed and lowercased:
+
+| OS | Source |
+| -- | ------ |
+| macOS | `IOPlatformUUID` (`/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice`) |
+| Linux | `/etc/machine-id`, then `/var/lib/dbus/machine-id` |
+| Windows | `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` (64-bit registry view, via `reg.exe /reg:64`) |
+
+These ids survive network changes, renames, disk usage and USB devices. Including the app id means two different apps on the same machine get unrelated HWIDs. Every AuthForge SDK computes the same value for the same app id and machine; the shared `hwid_vectors.json` pins this (alongside `offline_license_vectors.json`, `activation_request_vectors.json` and `self_serve_activation_vectors.json`).
+
+If no valid OS id can be read (for example a container without `/etc/machine-id`), the SDK falls back to `legacy:<the pre-2.0 fingerprint of hostname, OS and MAC>` as the machine id. Containers built from one image can also share a baked-in machine id, so for containers prefer `hwid_override` with an identifier you control.
+
+For non-device identities (for example Telegram users), pass `hwid_override` such as `tg:<user_id>`.
 
 ## Migrating from HeartbeatMode
 
