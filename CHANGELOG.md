@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.0 (unreleased)
+## 2.0.0
 
 ### Breaking
 
@@ -8,6 +8,10 @@
 - **Every bound HWID changes once on upgrade.** Online, a device rebinds into a free HWID slot, or the license needs an HWID reset. Offline `.authforge` files bound to a pre-2.0 HWID fail with `HwidMismatch` and must be re-issued (collect the new HWID with `create_activation_request`).
 - HWIDs are now identical across all AuthForge SDKs for the same app id and machine, and different between apps on the same machine. Containers without a unique `/etc/machine-id` should set `hwid_override`.
 - `hwid_override` behaves as before. No new crate dependencies.
+- **Local session expiry reports `SessionExpired`.** When the grace period ends, or a transient check-in failure happens after the session TTL has passed, the background failure is now `AuthForgeError::SessionExpired` (`code()` is `"session_expired"`) instead of `Expired`, matching the other SDKs. `Expired` now only means the server's license-expired verdict; arms that matched `Expired` to detect the end of the grace period must match `SessionExpired`.
+- **`AuthForgeError` is `#[non_exhaustive]`.** Every `match` on it needs a `_ =>` arm. Later minor releases can then give new server codes their own variants; until then they still arrive as `Other(String)`.
+- **`malformed_request` has its own variant.** It maps to the new `AuthForgeError::MalformedRequest` (definitive, `code()` is `"malformed_request"`) instead of `Other("malformed_request")`. `BadRequest` stays the server's `bad_request` only, and stays transient.
+- **Legacy `on_failure` receives the `Display` form.** Without `on_heartbeat_failure`, background check failures now reach `on_failure` as the error's `Display` string (`"revoked"`, `"network_error: ..."`), the stable code the other SDKs use, instead of its `Debug` string (`"Revoked"`, `"NetworkError(\"...\")"`). Callers comparing the string must compare the code.
 
 ### Tests
 
@@ -50,4 +54,4 @@
 
 ### Known differences from 1.3.x
 
-- **`malformed_request`** is now `Other("malformed_request")` instead of `BadRequest`, so `matches!(err, AuthForgeError::BadRequest)` no longer catches it. `BadRequest` also carries the server's `bad_request`, which is transient, so it can't also stand for the definitive `malformed_request`. A dedicated variant is planned for the next major (see `NEXT_MAJOR.md`).
+- **`malformed_request`** is now `Other("malformed_request")` instead of `BadRequest`, so `matches!(err, AuthForgeError::BadRequest)` no longer catches it. `BadRequest` also carries the server's `bad_request`, which is transient, so it can't also stand for the definitive `malformed_request`. 2.0.0 gives it the dedicated `MalformedRequest` variant.

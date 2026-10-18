@@ -5,7 +5,7 @@ Official Rust SDK for [AuthForge](https://authforge.cc): online license activati
 ## How it works
 
 1. **Activate**: `login()` calls `POST /auth/validate` online. The server checks revocation, expiry, HWID binding, and credits, then returns an Ed25519-signed session with a TTL.
-2. **Grace period** (the default): the app keeps running on the signed session without contacting AuthForge. The grace period equals the session TTL: the server default is 24h, and requested values are clamped to 1h to 7d. When it expires, the SDK clears the session and reports `Expired` to `on_heartbeat_failure` (or `on_failure`).
+2. **Grace period** (the default): the app keeps running on the signed session without contacting AuthForge. The grace period equals the session TTL: the server default is 24h, and requested values are clamped to 1h to 7d. When it expires, the SDK clears the session and reports `SessionExpired` to `on_heartbeat_failure` (or `on_failure`).
 3. **Online check-ins** (opt-in): set `online_heartbeat: true` to send periodic `POST /auth/heartbeat` requests instead. This gives you fast revocation and concurrent-use detection at the cost of network traffic and heartbeat credits.
 
 ## Features
@@ -37,11 +37,11 @@ From your project root:
 cargo add authforge
 ```
 
-Or declare a semver range in `Cargo.toml` (for example `1.1` picks up `1.1.x` patches):
+Or declare a semver range in `Cargo.toml` (for example `2.0` picks up `2.0.x` patches):
 
 ```toml
 [dependencies]
-authforge = "1.1"
+authforge = "2.0"
 ```
 
 ### Git dependency (unreleased changes)
@@ -118,7 +118,7 @@ To enable online check-ins instead, add `online_heartbeat: true` (and optionally
 | `heartbeat_mode` | `HeartbeatMode` | `Local` | **Deprecated**: see [Migrating from HeartbeatMode](#migrating-from-heartbeatmode). |
 | `heartbeat_interval` | `u64` | `900` | Seconds between online check-ins or grace period checks (minimum `10`; default 15 min) |
 | `api_base_url` | `String` | `https://auth.authforge.cc` | API base URL |
-| `on_failure` | `Option<Box<dyn Fn(&str)+Send+Sync>>` | `None` | Callback invoked when auth fails. Background check failures arrive as the error's `Debug` form (`"Revoked"`, `"NetworkError(\"...\")"`) unless `on_heartbeat_failure` is set |
+| `on_failure` | `Option<Box<dyn Fn(&str)+Send+Sync>>` | `None` | Callback invoked when auth fails. Background check failures arrive as the error's `Display` form (`"revoked"`, `"network_error: ..."`) unless `on_heartbeat_failure` is set |
 | `on_heartbeat_failure` | `Option<Box<dyn Fn(&AuthForgeError)+Send+Sync>>` | `None` | Receives background check failures as the typed error, instead of `on_failure` (see [Background check failures](#background-check-failures)) |
 | `request_timeout` | `u64` | `15` | Request timeout in seconds |
 | `heartbeat_request_timeout` | `Option<u64>` | `None` (8 seconds) | HTTP timeout in seconds for `/auth/heartbeat` only. Keep it below `request_timeout` so a stuck check-in doesn't hold up `logout()` |
@@ -156,19 +156,19 @@ A comma-separated `public_key` (`"NEW,PREVIOUS"`) works too, for env-var conveni
 
 ## Grace period and online check-ins
 
-- **Grace period** (the default, no config needed): after a successful online activation, the app keeps running on the Ed25519-signed session without contacting AuthForge. On each `heartbeat_interval` the SDK confirms the session is still authenticated and that the stored expiry has not passed, failing with `Expired` once it has. (The other SDKs report `session_expired` here; Rust keeps `Expired` until the next major release.) (The signature was already verified at activation; the check is expiry-only and does not re-verify the cached signature.) The grace period equals the session TTL: server default 24h, clamped to 1h to 7d via `session_ttl_seconds`.
+- **Grace period** (the default, no config needed): after a successful online activation, the app keeps running on the Ed25519-signed session without contacting AuthForge. On each `heartbeat_interval` the SDK confirms the session is still authenticated and that the stored expiry has not passed, failing with `SessionExpired` once it has. (The signature was already verified at activation; the check is expiry-only and does not re-verify the cached signature.) The grace period equals the session TTL: server default 24h, clamped to 1h to 7d via `session_ttl_seconds`.
 - **Online check-ins** (`online_heartbeat: true`): the SDK sends `/auth/heartbeat` on each interval, verifies the signature + nonce, and refreshes the stored session. Use this when you need fast revocation or concurrent-use detection; revocations take effect on the **next** check-in rather than at the end of the grace period.
 
 Either way, the grace period is session continuation after one successful online activation, not persistent offline licensing. The app must reach AuthForge again once the signed session expires. For machines that can never reach AuthForge, use an [offline license file](#offline-license-files-authforge) instead.
 
 ## Background check failures
 
-Each failed grace period check or online check-in is reported once, to `on_heartbeat_failure` (or, if that isn't set, to `on_failure` as the error's `Debug` string). Without a callback, a transient failure prints `AuthForge: background check failed (<code>); retrying next interval` to stderr and checks again next interval; a fatal one (including `Expired`) clears the session and stops background checks without output, and the process keeps running, so check `is_authenticated()` or set a callback. The reason is `err.code()`, and `err.is_transient()` / `err.is_fatal()` tell you what the SDK did about it:
+Each failed grace period check or online check-in is reported once, to `on_heartbeat_failure` (or, if that isn't set, to `on_failure` as the error's `Display` string). Without a callback, a transient failure prints `AuthForge: background check failed (<code>); retrying next interval` to stderr and checks again next interval; a fatal one (including `SessionExpired`) clears the session and stops background checks without output, and the process keeps running, so check `is_authenticated()` or set a callback. The reason is `err.code()`, and `err.is_transient()` / `err.is_fatal()` tell you what the SDK did about it:
 
 | Classification | Codes | What the SDK does |
 | --- | --- | --- |
 | Definitive (`is_fatal()`) | `revoked`, `expired`, `hwid_mismatch`, `blocked`, `session_expired`, `malformed_request`, `app_disabled`, `invalid_app`, `signature_mismatch` (listed in `authforge::DEFINITIVE_ERROR_CODES`, which also holds the `activate_offline` codes `offline_activation_disabled`, `offline_activation_requires_perpetual`, `offline_activation_requires_seats`, `offline_activation_limit_reached` and `offline_file_rejected`) | Clears the session (as `logout()` does) and stops background checks, then invokes the callback. `is_authenticated()` is already `false` inside it. |
-| Transient (`is_transient()`) | Everything else: `network_error`, `timeout`, `rate_limited`, `system_error`, `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached`, `bad_request`, `invalid_key`, every `http_error_N`, `invalid_json_response`, `unexpected_response`, and any code this SDK version doesn't know | Keeps the session, invokes the callback, and checks again at the next interval. A transient failure after the session TTL has passed is reported as `Expired` instead (definitive). |
+| Transient (`is_transient()`) | Everything else: `network_error`, `timeout`, `rate_limited`, `system_error`, `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached`, `bad_request`, `invalid_key`, every `http_error_N`, `invalid_json_response`, `unexpected_response`, and any code this SDK version doesn't know | Keeps the session, invokes the callback, and checks again at the next interval. A transient failure after the session TTL has passed is reported as `SessionExpired` instead (definitive). |
 
 On check-ins, `hwid_mismatch` means this HWID is no longer bound to the license (for example after an HWID reset in the dashboard), and `blocked` means the HWID or IP is blacklisted, or isn't on the app's whitelist. A failed check-in only counts as a server verdict when its body is a JSON object with `"status": "failed"` and a non-empty `error`; any other failure body is the transient `unexpected_response`. `authforge::is_transient_error_code(code)` applies the same classification to a code string.
 
@@ -395,7 +395,7 @@ Errors are returned as `AuthForgeError`, including:
 
 - `InvalidApp`
 - `InvalidKey`
-- `Expired` (the server's `expired`, and also local session TTL expiry)
+- `Expired` (the server's `expired`: the license has expired)
 - `Revoked`
 - `HwidMismatch`
 - `NoCredits`
@@ -404,15 +404,16 @@ Errors are returned as `AuthForgeError`, including:
 - `RateLimited`
 - `ReplayDetected`
 - `AppDisabled`
-- `SessionExpired` (the server's `session_expired`)
+- `SessionExpired` (the server's `session_expired`, and also local session TTL expiry)
 - `RevokeRequiresSession`
 - `BadRequest` (`bad_request`)
+- `MalformedRequest` (`malformed_request`)
 - `SystemError`
 - `SignatureMismatch`
 - `NetworkError(String)` (`code()` is `network_error`, `timeout` or `invalid_json_response`)
-- `Other(String)` (`malformed_request`, the `offline_activation_*` codes, unknown server codes, and SDK codes such as `http_error_502`, `unexpected_response`, `offline_file_rejected` or `file_write_failed`)
+- `Other(String)` (the `offline_activation_*` codes, unknown server codes, and SDK codes such as `http_error_502`, `unexpected_response`, `offline_file_rejected` or `file_write_failed`)
 
-`err.code()` returns the machine-readable code for any variant, `err.to_string()` its `Display` form, and `err.is_transient()` / `err.is_fatal()` its classification (see [Background check failures](#background-check-failures)). `AuthForgeError` implements `std::error::Error`.
+`err.code()` returns the machine-readable code for any variant, `err.to_string()` its `Display` form, and `err.is_transient()` / `err.is_fatal()` its classification (see [Background check failures](#background-check-failures)). `AuthForgeError` implements `std::error::Error`. It is `#[non_exhaustive]`, so a `match` on it needs a `_ =>` arm; later minor releases may add variants for new server codes.
 
 Retry behavior is handled inside the internal HTTP request layer:
 - `rate_limited`, or a 429 without an error code: retry after 2s, then 5s (max 3 attempts total). A 429 with `no_credits`, `demo_quota_exceeded` or `app_burn_cap_reached` is not retried

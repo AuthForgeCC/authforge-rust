@@ -133,6 +133,7 @@ pub struct LoginResult {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AuthForgeError {
     InvalidApp,
     InvalidKey,
@@ -148,6 +149,7 @@ pub enum AuthForgeError {
     SessionExpired,
     RevokeRequiresSession,
     BadRequest,
+    MalformedRequest,
     SystemError,
     SignatureMismatch,
     NetworkError(String),
@@ -156,8 +158,8 @@ pub enum AuthForgeError {
 
 impl AuthForgeError {
     /// Machine-readable code: the server's error code (`"revoked"`,
-    /// `"hwid_mismatch"`, ...; `malformed_request`, the `offline_activation_*`
-    /// codes and unknown codes arrive as `Other(code)`) or an SDK code
+    /// `"hwid_mismatch"`, ...; the `offline_activation_*` codes and unknown
+    /// codes arrive as `Other(code)`) or an SDK code
     /// (`"network_error"`, `"timeout"`, `"http_error_502"`,
     /// `"unexpected_response"`, `"offline_file_rejected"`, ...).
     pub fn code(&self) -> &str {
@@ -176,6 +178,7 @@ impl AuthForgeError {
             Self::SessionExpired => "session_expired",
             Self::RevokeRequiresSession => "revoke_requires_session",
             Self::BadRequest => "bad_request",
+            Self::MalformedRequest => "malformed_request",
             Self::SystemError => "system_error",
             Self::SignatureMismatch => "signature_mismatch",
             Self::NetworkError(detail) => {
@@ -1089,7 +1092,7 @@ impl AuthForgeClient {
 
     /// Grace period check: no network. Confirms the session is still
     /// authenticated and the stored expiry has not passed, failing with
-    /// `Expired` once the grace period (the session TTL) runs out.
+    /// `SessionExpired` once the grace period (the session TTL) runs out.
     fn grace_period_check(&self) -> Result<(), AuthForgeError> {
         let (authenticated, expires_in) = {
             let state = self
@@ -1101,13 +1104,13 @@ impl AuthForgeClient {
         };
 
         if !authenticated {
-            return Err(AuthForgeError::Expired);
+            return Err(AuthForgeError::SessionExpired);
         }
 
-        let expires = expires_in.ok_or(AuthForgeError::Expired)?;
+        let expires = expires_in.ok_or(AuthForgeError::SessionExpired)?;
         let now = epoch_now();
         if now >= expires {
-            return Err(AuthForgeError::Expired);
+            return Err(AuthForgeError::SessionExpired);
         }
 
         Ok(())
@@ -1290,9 +1293,9 @@ impl AuthForgeClient {
         }
 
         // A transient failure can't extend the session past its signed TTL.
-        // Local TTL expiry reports `Expired`, like the grace period check.
+        // Local TTL expiry reports `SessionExpired`, like the grace period check.
         let failure = if err.is_transient() && self.local_session_expired() {
-            AuthForgeError::Expired
+            AuthForgeError::SessionExpired
         } else {
             err
         };
@@ -1303,7 +1306,7 @@ impl AuthForgeClient {
         if let Some(callback) = &self.inner.cfg.on_heartbeat_failure {
             callback(&failure);
         } else if let Some(callback) = &self.inner.cfg.on_failure {
-            callback(&format!("{failure:?}"));
+            callback(&failure.to_string());
         } else if !fatal {
             (self.inner.warn)(&format!(
                 "AuthForge: background check failed ({}); retrying next interval",
@@ -1847,7 +1850,7 @@ mod heartbeat_tests {
     #[test]
     fn malformed_request_keeps_its_code() {
         let err = map_server_error("malformed_request");
-        assert!(matches!(&err, AuthForgeError::Other(code) if code == "malformed_request"));
+        assert!(matches!(&err, AuthForgeError::MalformedRequest));
         assert_eq!(err.code(), "malformed_request");
         assert_eq!(err.to_string(), "malformed_request");
         assert!(err.is_fatal());
@@ -1977,12 +1980,12 @@ mod heartbeat_tests {
     }
 
     #[test]
-    fn transient_failure_after_ttl_becomes_expired() {
+    fn transient_failure_after_ttl_becomes_session_expired() {
         let harness = Harness::new(vec![failed(500, "system_error")]);
         seed_session(&harness.client, SEED_TOKEN, epoch_now() - 1);
         let keep_checking = harness.tick();
-        harness.assert_fatal(keep_checking, "expired", 1);
-        assert!(matches!(harness.only_failure(), AuthForgeError::Expired));
+        harness.assert_fatal(keep_checking, "session_expired", 1);
+        assert!(matches!(harness.only_failure(), AuthForgeError::SessionExpired));
     }
 
     #[test]
@@ -2004,24 +2007,24 @@ mod heartbeat_tests {
     }
 
     #[test]
-    fn grace_period_expiry_is_expired() {
+    fn grace_period_expiry_is_session_expired() {
         let harness = Harness::with(Vec::new(), |config| config.online_heartbeat = false);
         assert!(harness.tick());
         assert!(harness.failures.lock().expect("failures").is_empty());
 
         seed_session(&harness.client, SEED_TOKEN, epoch_now() - 1);
         let keep_checking = harness.tick();
-        harness.assert_fatal(keep_checking, "expired", 0);
-        assert!(matches!(harness.only_failure(), AuthForgeError::Expired));
+        harness.assert_fatal(keep_checking, "session_expired", 0);
+        assert!(matches!(harness.only_failure(), AuthForgeError::SessionExpired));
 
         let harness = Harness::with(Vec::new(), |config| config.online_heartbeat = false);
         harness.client.inner.state.lock().expect("state").authenticated = false;
         let keep_checking = harness.tick();
-        harness.assert_fatal(keep_checking, "expired", 0);
+        harness.assert_fatal(keep_checking, "session_expired", 0);
     }
 
     #[test]
-    fn legacy_on_failure_receives_the_debug_form() {
+    fn legacy_on_failure_receives_the_display_form() {
         let server = MockServer::start(vec![failed(410, "revoked")]);
         let messages = Arc::new(Mutex::new(Vec::<String>::new()));
         let legacy = Arc::clone(&messages);
@@ -2032,7 +2035,7 @@ mod heartbeat_tests {
         });
         use_heartbeat_nonce();
         assert!(!client.heartbeat_tick());
-        assert_eq!(*messages.lock().expect("messages"), vec!["Revoked".to_string()]);
+        assert_eq!(*messages.lock().expect("messages"), vec!["revoked".to_string()]);
         assert!(!client.is_authenticated());
     }
 
@@ -2052,7 +2055,7 @@ mod heartbeat_tests {
     }
 
     /// The Rust SDK never exits the process: with no callback a definitive
-    /// failure, including the TTL-promoted `Expired`, ends the session silently.
+    /// failure, including the TTL-promoted `SessionExpired`, ends the session silently.
     #[test]
     fn without_callbacks_a_definitive_failure_ends_the_session_silently() {
         let cases = [
@@ -2107,6 +2110,8 @@ mod heartbeat_tests {
         }
         assert!(AuthForgeError::Revoked.is_fatal());
         assert!(AuthForgeError::SessionExpired.is_fatal());
+        assert!(AuthForgeError::MalformedRequest.is_fatal());
+        assert!(AuthForgeError::BadRequest.is_transient());
         assert!(AuthForgeError::SignatureMismatch.is_fatal());
         assert!(AuthForgeError::NoCredits.is_transient());
         assert!(AuthForgeError::ReplayDetected.is_transient());
@@ -2411,6 +2416,7 @@ fn map_server_error(error: &str) -> AuthForgeError {
         "replay_detected" => AuthForgeError::ReplayDetected,
         "revoke_requires_session" => AuthForgeError::RevokeRequiresSession,
         "bad_request" => AuthForgeError::BadRequest,
+        "malformed_request" => AuthForgeError::MalformedRequest,
         "system_error" => AuthForgeError::SystemError,
         _ => AuthForgeError::Other(error.to_string())
     }

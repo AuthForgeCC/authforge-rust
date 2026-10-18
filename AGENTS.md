@@ -99,7 +99,7 @@ To enable online check-ins, add `online_heartbeat: true` (and optionally set `he
 | `heartbeat_mode` | `HeartbeatMode` | no | `Local` | **Deprecated**: see [Migrating from HeartbeatMode](#migrating-from-heartbeatmode) |
 | `heartbeat_interval` | `u64` | no | `900` | Seconds between online check-ins or grace period checks (minimum `10`; `0` coerced to `900`) |
 | `api_base_url` | `String` | no | `https://auth.authforge.cc` | API base URL |
-| `on_failure` | `Option<Box<dyn Fn(&str) + Send + Sync>>` | no | `None` | Invoked on background check failure with the error's `Debug` string (`"Revoked"`, `"NetworkError(\"...\")"`) unless `on_heartbeat_failure` is set, and on `login` network failure after retry; **not** invoked for `validate_license` network errors |
+| `on_failure` | `Option<Box<dyn Fn(&str) + Send + Sync>>` | no | `None` | Invoked on background check failure with the error's `Display` string (`"revoked"`, `"network_error: ..."`) unless `on_heartbeat_failure` is set, and on `login` network failure after retry; **not** invoked for `validate_license` network errors |
 | `on_heartbeat_failure` | `Option<Box<dyn Fn(&AuthForgeError) + Send + Sync>>` | no | `None` | Receives background check failures as the typed error instead of `on_failure`; use `err.code()` and `err.is_transient()` |
 | `request_timeout` | `u64` | no | `15` | HTTP timeout seconds (`0` coerced to `15`) |
 | `heartbeat_request_timeout` | `Option<u64>` | no | `None` (8 seconds) | HTTP timeout seconds for `/auth/heartbeat` only (`0` coerced to `8`); keep it below `request_timeout` |
@@ -141,7 +141,7 @@ Full set: invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits,
 
 `activate_offline` only: offline_activation_disabled, offline_activation_requires_perpetual, offline_activation_requires_seats, offline_activation_limit_reached (all fatal). The SDK adds `offline_file_rejected` (fatal; the returned file failed local verification, reason in the message), `file_write_failed` (transient) and uses `unexpected_response` (transient) for a success without a file.
 
-(Maps to `AuthForgeError` variants; `bad_request` maps to `BadRequest`, while `malformed_request`, the `offline_activation_*` codes and unknown strings map to `AuthForgeError::Other(code)`. `err.code()` returns the code string for every variant.)
+(Maps to `AuthForgeError` variants; `bad_request` maps to `BadRequest` and `malformed_request` to `MalformedRequest`, while the `offline_activation_*` codes and unknown strings map to `AuthForgeError::Other(code)`. The enum is `#[non_exhaustive]`: a `match` on it needs a `_ =>` arm. `err.code()` returns the code string for every variant.)
 
 Notes:
 - `replay_detected` is validate-only. `rate_limited` can be returned by `/auth/validate` and `/auth/heartbeat` (heartbeat is license-limited at 6/min and has no app-layer IP limit).
@@ -152,9 +152,9 @@ Notes:
 | Classification | Codes | SDK behavior |
 |----------------|-------|--------------|
 | Definitive (`err.is_fatal()`) | `revoked`, `expired`, `hwid_mismatch`, `blocked`, `session_expired`, `malformed_request`, `app_disabled`, `invalid_app`, `signature_mismatch` (`authforge::DEFINITIVE_ERROR_CODES`, which also lists the `activate_offline` codes `offline_activation_disabled`, `offline_activation_requires_perpetual`, `offline_activation_requires_seats`, `offline_activation_limit_reached`, `offline_file_rejected`) | Clears the session (as `logout()`), stops background checks, then invokes the callback |
-| Transient (`err.is_transient()`) | Everything else, including `network_error`, `timeout`, `rate_limited`, `system_error`, `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached`, `bad_request`, `invalid_key`, `http_error_N`, `invalid_json_response`, `unexpected_response` and unknown codes | Keeps the session, invokes the callback, checks again next interval; after the session TTL passes it becomes `Expired` |
+| Transient (`err.is_transient()`) | Everything else, including `network_error`, `timeout`, `rate_limited`, `system_error`, `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached`, `bad_request`, `invalid_key`, `http_error_N`, `invalid_json_response`, `unexpected_response` and unknown codes | Keeps the session, invokes the callback, checks again next interval; after the session TTL passes it becomes `SessionExpired` |
 
-A failed check-in is a server verdict only when the body is a JSON object with `"status": "failed"` and a non-empty `error`; anything else is the transient `unexpected_response`. Local session TTL expiry (the grace period ending, or a transient failure after the TTL) reports `Expired`, not `SessionExpired`; `SessionExpired` means the server returned `session_expired`. `authforge::is_transient_error_code(code)` classifies a code string.
+A failed check-in is a server verdict only when the body is a JSON object with `"status": "failed"` and a non-empty `error`; anything else is the transient `unexpected_response`. Local session TTL expiry (the grace period ending, or a transient failure after the TTL) reports `SessionExpired`, like the server's `session_expired`; `Expired` means the server returned `expired` (the license has expired). `authforge::is_transient_error_code(code)` classifies a code string.
 
 Thread safety: callbacks run on the heartbeat thread with no SDK lock held, so calling `logout()` / `is_authenticated()` or dropping the client from inside them is safe. A check-in in flight during `logout()` or a new `login()` never writes to the new session.
 
@@ -230,7 +230,7 @@ if !ready {
 
 ### Custom error handling
 
-Handle `AuthForgeError` from `login` or `validate_license`. Background check failures (grace period expiry or a failed online check-in) invoke `on_heartbeat_failure` with the typed error, or `on_failure` with its `Debug` string when `on_heartbeat_failure` is not set. `validate_license` transport failures return `Err(NetworkError)` without calling `on_failure`.
+Handle `AuthForgeError` from `login` or `validate_license`. Background check failures (grace period expiry or a failed online check-in) invoke `on_heartbeat_failure` with the typed error, or `on_failure` with its `Display` string when `on_heartbeat_failure` is not set. `validate_license` transport failures return `Err(NetworkError)` without calling `on_failure`.
 
 ```rust
 use authforge::{AuthForgeClient, AuthForgeConfig, AuthForgeError};
@@ -261,7 +261,7 @@ let client = AuthForgeClient::new(AuthForgeConfig {
 
 - Do not hardcode the app secret as a plain string literal in source; use environment variables or encrypted config
 - Do not embed the App Secret in air-gapped / `login_from_file` builds; leave `app_secret` empty (`Default` already does); verification only needs app id + public key
-- Do not omit `on_heartbeat_failure` (or `on_failure`) if you need controlled shutdown; checks run in a background thread and failures are reported through this callback. Without one, transient failures only print a stderr warning and fatal ones (including `Expired`) clear the session silently; the SDK never exits the process for you
+- Do not omit `on_heartbeat_failure` (or `on_failure`) if you need controlled shutdown; checks run in a background thread and failures are reported through this callback. Without one, transient failures only print a stderr warning and fatal ones (including `SessionExpired`) clear the session silently; the SDK never exits the process for you
 - Do not call `std::process::exit` from the callback as the normal shutdown path: send on an `mpsc` channel so the main thread can save work and exit
 - Do not exit on transient background failures (`err.is_transient()`); the SDK keeps the session and checks in again, and only definitive failures end it
 - Do not call `login` on every app action; call once at startup, the grace period (or online check-ins) handles the rest
